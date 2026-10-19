@@ -4,7 +4,7 @@ A lightweight retro console audio player built in **IWBasic 2.5**. Powered by th
 
 ---
 
-## ðŸ“¸ Screenshots
+## 📸 Screenshots
 
 | Player Main HUD | Equalizer & DSP Engine | Extended Audio Settings |
 | :---: | :---: | :---: |
@@ -12,7 +12,7 @@ A lightweight retro console audio player built in **IWBasic 2.5**. Powered by th
 
 ---
 
-## âœ¨ Features
+## ✨ Features
 
 * **Audio Engine & Format Support**
   * Powered by Un4seen BASS & BASS_FLAC sound libraries.
@@ -54,7 +54,7 @@ A lightweight retro console audio player built in **IWBasic 2.5**. Powered by th
 
 ---
 
-## âŒ¨ï¸ Controls & Hotkeys
+## ⌨️ Controls & Hotkeys
 
 ### Main Player View
 | Key | Action |
@@ -92,7 +92,7 @@ A lightweight retro console audio player built in **IWBasic 2.5**. Powered by th
 
 ---
 
-## ðŸš€ Usage
+## 🚀 Usage
 
 Launch **CPlay** from the Command Prompt or Terminal:
 
@@ -112,7 +112,7 @@ cplay.exe -r
 
 ---
 
-## ðŸ› ï¸ Building from Source
+## 🛠️ Building from Source
 
 ### Prerequisites
 * **Compiler**: IWBasic 2.5 (or higher)
