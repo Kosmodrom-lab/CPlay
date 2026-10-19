@@ -121,11 +121,11 @@ cplay.exe -r
 * **DLL Dependencies**: Place `bass.dll` and `bassflac.dll` in the application root folder.
 
 ### Build Command
-Compile `CP_3.iwb` directly via the IWBasic IDE.
+Compile `cplay.iwb` directly via the IWBasic IDE.
 ```
 
 ---
 
-## ðŸ“„ License
+## 📄 License
 
 This project is open-source. BASS audio library binaries (`bass.dll`, `bassflac.dll`) are property of Un4seen Developments.
