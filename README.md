@@ -6,11 +6,9 @@ A lightweight retro console audio player built in **IWBasic 2.5**. Powered by th
 
 ## ðŸ“¸ Screenshots
 
-Place your screenshot files into a `docs/screenshots/` directory in your repository to display them on the GitHub landing page:
-
 | Player Main HUD | Equalizer & DSP Engine | Extended Audio Settings |
 | :---: | :---: | :---: |
-| ![Main Player View](docs/screenshots/player_main.png) | ![Equalizer & DSP](docs/screenshots/options_eq_dsp.png) | ![Audio Engine Options](docs/screenshots/options_extended.png) |
+| ![Main Player View](docs/player_main.png) | ![Equalizer & DSP](docs/options_eq_dsp.png) | ![Audio Engine Options](docs/options_extended.png) |
 
 ---
 
