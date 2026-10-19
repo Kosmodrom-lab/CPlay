@@ -1,0 +1,16 @@
+              CPlay (beta)
+        Fast Console Audio Player
+      -----------------------------
+      A lightning-fast, dependency-
+      free audio player built for 
+      IWBasic 2.5 and the BASS engine.
+      
+      Features:
+     - MP3 & FLAC streaming support
+     - Native ID3v1/v2 & Vorbis parser
+     - 60-char text box for Comments 
+        & Lyrics with UTF-8 / OEM fix
+     - Dynamic retro color themes
+     - Side-by-side folder cover art
+      
+          (c) 2026 Y. Dalissier

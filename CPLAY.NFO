@@ -1,0 +1,37 @@
+==============================================================================
++------++------++       +------++      +
+¦       ¦      ¦¦       +------¦¦      ¦
+¦       ¦------+¦       ¦      ¦+------¦
++------++       +------++------++------+  
+==============================================================================
+  CPlay (beta)  - Fast Console Audio Player
+  Release Date  : October 2026
+  Author        : Y. Dalissier
+  Platform      : Windows All
+  Audio Engine  : BASS 2.3 (MP3 & FLAC)
+==============================================================================
+
+  [ RELEASE NOTES ]
+  CPlay is a lightning-fast console audio player crafted specifically
+  for retro enthusiasts and clean-code purists. Built from the ground
+  up in IWBasic 2.5, it features a custom dependency-free memory parser 
+  for ID3v1, ID3v2, Vorbis comments, completely bypassing external DLLs.
+
+  [ KEY FEATURES ]
+  * Audio Support     : Native MP3 & FLAC streaming via BASS engine with 
+                        wildcard queueing and relative/absolute M3U parsing.
+  * International Text: Universal UTF-8 to OEM codepage transcoding and 
+                        signed-byte masking ensuring flawless rendering of 
+                        accents (Ã©, Ã , Ãª).
+  * Memory-Safe Text  : Pointer-based stack buffers (8KB) bypassing the 
+                        native 255-character string limitation for full 
+                        scrolling comments and lyrics (lines 17-22).
+  * Visual Interface  : GDI+ cover art extraction (side-by-side display), 
+                        dynamic color themes (Retro, Matrix, Amber CRT), 
+                        and real-time VU meters.
+  * Ergonomics        : Arrow layout (Up/Down for volume, 
+                        Left/Right for seeking).
+
+==============================================================================
+  "Keep the retro vibes alive!"
+==============================================================================

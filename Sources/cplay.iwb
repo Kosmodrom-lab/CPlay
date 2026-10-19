@@ -1,0 +1,3780 @@
+' ============================================================================
+' Project: CPlay - Fast Console Audio Player
+' Compiler: IWBasic 2.5
+' Features: MP3/FLAC, Native Metadata, Synced LRC Lyrics, Retro Themes, 
+'           10-Block Vertical VU Meter Towers, Isolated Console Buffer,
+'           10-Band ISO Graphic Equalizer Engine (.eq)
+' ============================================================================
+
+$USE "bass.lib"
+$USE "bassflac.lib"
+$USE "ctl.lib"
+$USE "gdiplus.lib"
+$USE "normaliz.lib"
+
+$INCLUDE "windowssdk.inc"
+$INCLUDE "fletchie_ctl.inc"
+$INCLUDE "bass22.inc"
+$INCLUDE "gdiplus.inc"
+
+DECLARE IMPORT, API_LineTo ALIAS "LineTo"(UINT hdc, INT x, INT y), INT
+DECLARE IMPORT, NormalizeString(INT NormForm, POINTER lpSrcString, INT cwSrcLength, POINTER lpDstString, INT cwDstLength), INT
+
+' --- BASS Declarations ---
+DECLARE EXTERN BASS_FLAC_StreamCreateFile(INT mem, POINTER f, INT offset, INT length, INT flags),HSTREAM
+DECLARE EXTERN BASS_ChannelGetTags(DWORD handle, DWORD tags), POINTER
+
+CONST NormalizationC = 1
+CONST CP_OEMCP = 1
+CONST CP_UTF8  = 65001
+CONST MB_ERR_INVALID_CHARS = 8
+
+' ----------------------------------------------------------------------------
+' BASS Constants & Types
+' ----------------------------------------------------------------------------
+CONST BASS_CONFIG_BUFFER       = 0
+CONST BASS_CONFIG_UPDATEPERIOD = 1
+CONST BASS_CONFIG_DEV_BUFFER   = 27
+CONST BASS_DEVICE_DMIX         = 8
+CONST BASS_STREAM_PRESCAN      = 0x20000
+CONST BASS_TAG_ID3             = 0
+CONST BASS_FILEPOS_END         = 2
+CONST BASS_CTYPE_STREAM_FLAC   = 0x10900
+CONST BASS_TAG_FLAC_PICTURE    = 0x12000
+CONST BASS_UNICODE             = 0x80000000
+CONST BASS_DEVICE_ENABLED      = 1
+CONST BASS_DEVICE_DEFAULT      = 2
+CONST BASS_DEVICE_INIT         = 4
+
+TYPE BASS_DX8_PARAMEQ
+    FLOAT fCenter
+    FLOAT fBandwidth
+    FLOAT fGain
+ENDTYPE
+
+TYPE BASS_DX8_COMPRESSOR
+    FLOAT fGain        ' Gain compensation (-60 to +60 dB)
+    FLOAT fAttack      ' Attack time (0.01 to 500 ms)
+    FLOAT fRelease     ' Release time (50 to 3000 ms)
+    FLOAT fThreshold   ' Threshold (-60 to 0 dB)
+    FLOAT fRatio       ' Compression ratio (1:1 to 100:1)
+    FLOAT fPredelay    ' Pre-delay (0 to 4 ms)
+ENDTYPE
+
+TYPE BASS_DX8_REVERB
+    FLOAT fInGain          ' Input gain (-96 to 0 dB)
+    FLOAT fReverbMix       ' Reverb mix (-96 to 0 dB)
+    FLOAT fReverbTime      ' Reverb time (0.001 to 3000 ms)
+    FLOAT fHighFreqRHRatio ' High frequency ratio (0.001 to 0.999)
+ENDTYPE
+
+TYPE BASS_DEVICEINFO
+    POINTER name      ' Description of the device
+    POINTER driver    ' Driver filename / GUID
+    DWORD   flags     ' Device state flags (BASS_DEVICE_ENABLED, BASS_DEVICE_DEFAULT, etc.)
+ENDTYPE
+
+CONST BASS_FX_DX8_PARAMEQ = 7
+CONST BASS_FX_DX8_COMPRESSOR = 1
+CONST BASS_FX_DX8_REVERB     = 8
+' BASS Attribute Constant
+CONST BASS_ATTRIB_PAN = 3
+CONST BASS_SAMPLE_MONO = 0x0002
+
+' ----------------------------------------------------------------------------
+' Win32 Console Color Constants
+' ----------------------------------------------------------------------------
+CONST C_BLACK        = 0x0000
+CONST C_DARK_BLUE    = 0x0001
+CONST C_DARK_GREEN   = 0x0002
+CONST C_DARK_CYAN    = 0x0003
+CONST C_DARK_RED     = 0x0004
+CONST C_DARK_MAGENTA = 0x0005
+CONST C_DARK_YELLOW  = 0x0006
+CONST C_LIGHT_GRAY   = 0x0007 
+CONST C_DARK_GRAY    = 0x0008 
+CONST C_BLUE         = 0x0009
+CONST C_GREEN        = 0x000A
+CONST C_CYAN         = 0x000B
+CONST C_RED          = 0x000C
+CONST C_MAGENTA      = 0x000D
+CONST C_YELLOW       = 0x000E
+CONST C_WHITE        = 0x000F 
+
+CONST MAX_PLAYLIST = 100000
+
+' ----------------------------------------------------------------------------
+' Global Handles & Buffers Memory
+' ----------------------------------------------------------------------------
+HANDLE g_hStdOut = 0
+HANDLE hPlayBuffer = 0
+HANDLE g_hConsole = 0
+
+' --- Dual Buffer & Options View Globals ---
+HANDLE hOptionsBuffer = 0
+INT g_InOptionsView   = 0
+
+' --- Third Screen Buffer Handle & View State ---
+HANDLE hMoreOptionsBuffer = 0
+' g_InOptionsView states: 0 = Player View, 1 = Main Options (EQ/DSP), 2 = Extended Options (Engine/Accessibility)
+
+' --- Audio devices enumeration ---
+STRING g_AudioDeviceList[16]
+INT    g_AudioDeviceIDs[16]
+INT    g_AudioDeviceCount = 0
+INT    g_SelectedDevice   = -1  ' -1 = Default Windows Audio Device
+
+' --- Extended Settings Globals ---
+INT g_Balance     = 0   ' -100 (Full L) to +100 (Full R), 0 = Center
+INT g_MonoDownmix = 0   ' 0 = Stereo, 1 = Mono Downmix
+INT g_Gapless     = 1   ' 0 = Disabled, 1 = Enabled
+INT g_Crossfade   = 0   ' 0 to 5 seconds
+INT g_ResumePos   = 0   ' 0 = Off, 1 = Remember position on exit
+INT g_MoreFocus   = 0   ' Focused row index (0 to 4)
+
+' 10 Bands EQ Listbox Coordinates on hOptionsBuffer
+CONST EQ_FORM_X = 42
+CONST EQ_FORM_Y = 9
+
+' --- 10-Band Graphic EQ Globals ---
+DOUBLE g_EqFreqs[10]
+DOUBLE g_EqGains[10]
+INT g_EqEnabled       = 1
+STRING g_EqProfile    = "Flat.eq"
+DOUBLE g_EqPrecut     = 0.0
+DWORD g_hEqFX[10]     ' BASS FX Handles for 10 active bands
+
+' --- Additional DSP Engine Globals ---
+INT g_NormEnabled   = 0  ' Volume Normalization Toggle
+INT g_CompEnabled   = 0  ' Compressor Toggle
+DWORD g_hCompFX     = 0  ' Compressor FX Handle
+
+INT g_ReverbEnabled = 0  ' Acoustic Decay Toggle
+DWORD g_hReverbFX   = 0  ' Reverb FX Handle
+
+' DSP Handles & Toggles
+INT g_TubeEnabled     = 0
+DWORD g_hTubeDSP      = 0
+INT g_WidenerEnabled  = 0
+DWORD g_hWidenerDSP   = 0
+
+' Options Screen 1 Navigation
+INT g_DspSelectedIndex = 0  ' Focused row in DSP Listbox (0 to 5)
+' g_OptionsFocus states:
+' 0 = Top-Left DSP Listbox
+' 1 = Bottom-Left EQ Presets Listbox
+' 2 = Right Panel 10-Band EQ Form
+
+' --- Save Preset Prompt Globals ---
+INT g_SavePromptActive = 0
+STRING g_SaveNameBuf   = ""
+
+' --- EQ Listbox & Selection Globals ---
+STRING g_EqFileList[50]
+INT g_EqFileCount     = 0
+INT g_EqSelectedIndex = 0
+INT g_SelectedEqBand
+
+' Debounce flags for Options screen navigation
+INT optUpDown    = 0
+INT optDownDown  = 0
+INT optEnterDown = 0
+INT g_OptionsFocus ' 0 = Profiles Listbox, 1 = EQ Band Visualizer
+INT optTabDown   = 0
+INT optLeftDown  = 0
+INT optRightDown = 0
+
+' Synced LRC Lyrics Engine
+TYPE LYRIC_LINE
+    DOUBLE timestamp
+    ISTRING text[80]
+ENDTYPE
+
+LYRIC_LINE g_SyncedLyrics[300]
+INT g_SyncedCount = 0
+INT g_IsSyncedLyrics = 0
+INT g_LyricLineChanged = 0
+
+' Auto-paging Timers & Lyric Trackers
+INT g_CommentPage = 0
+INT g_CommentTick = 0
+INT g_LastActiveLyric = -2
+
+STRING g_LastPlayedTitle = "None"
+
+DynaStore g_fileList
+STRING g_Playlist[MAX_PLAYLIST]
+INT g_TrackCount = 0
+INT g_Played[MAX_PLAYLIST]
+INT g_PlayedCount = 0
+INT g_History[MAX_PLAYLIST]
+INT g_HistoryPos = 0
+INT g_HistoryMax = 0
+INT g_Volume = 15
+INT g_Shuffle = 0
+INT g_Theme = 0
+INT wasMinimized = 0
+INT marqueeTick = 0
+INT marqueeOffset = 0
+
+' Global Active Track Metadata Buffers (For Screen Redraw Sync)
+STRING g_trackYear, g_trackNum
+STRING g_TrackArtist, g_TrackTitle, g_TrackAlbum
+STRING g_SpecFmt, g_SpecBit, g_SpecSiz
+ISTRING g_pComments[8192]
+ISTRING g_pLyrics[8192]
+STRING g_DispArtist, g_DispTitle, g_DispAlbum
+STRING g_PadArtist, g_PadTitle, g_PadAlbum
+INT commentLines, lyricLines
+
+' Colors
+INT colStatic, colArtist, colTitle, colAlbum, colQueue, colVol
+INT colStatusPlay, colStatusPause, colProg, colVU, colTech
+
+' Display and input buffers
+INT mArt, mTit, mAlb
+STRING cliArg
+INT argIdx, cliArgCount
+
+' BASS stream handles
+DWORD hStream
+POINTER pTrack
+DWORD g_hNextStream      = 0    ' Secondary background stream handle
+INT   g_PreloadDone      = 0    ' 1 = Next track already opened in RAM
+INT   g_NextTrackIdx     = -1   ' Playlist index of preloaded track
+DWORD g_hOldFadingStream = 0
+
+' Hardware polling and extended UI trackers
+INT leftDown = 0
+INT rightDown = 0
+INT upDown = 0
+INT downDown = 0
+INT g_ExtDisplay = 0  ' 0 = Hidden, 1 = Comments, 2 = Lyrics
+INT g_ExtScroll = 0
+
+' To resume playback of audio track
+INT g_LastTrackIdx   = 0
+QWORD g_LastTrackPos = 0q
+
+QWORD totalLenBytes, currentPosBytes, offsetBytes, newPosBytes
+DOUBLE totalSecs, currentSecs
+STRING keyPress
+INT skipTrack
+BASS_CHANNELINFO g_chanInfo
+DWORD vuLevel
+INT lLevel, rLevel
+
+' ----------------------------------------------------------------------------
+' Isolated Screen Buffer Subroutines
+' ----------------------------------------------------------------------------
+SUB InitConsoleScreen()
+    g_hStdOut = GetStdHandle(-11) ' STD_OUTPUT_HANDLE
+    
+    hPlayBuffer        = CreateConsoleScreenBuffer(0xC0000000, 3, 0, 1, 0)
+    hOptionsBuffer     = CreateConsoleScreenBuffer(0xC0000000, 3, 0, 1, 0)
+    hMoreOptionsBuffer = CreateConsoleScreenBuffer(0xC0000000, 3, 0, 1, 0)
+    
+    COORD newSize
+    newSize.X = 80 : newSize.Y = 27
+    
+    CONSOLE_CURSOR_INFO cInfo
+    cInfo.dwSize = 10 : cInfo.bVisible = 0
+
+    SMALL_RECT minRect
+    minRect.Left = 0 : minRect.Top = 0 : minRect.Right = 1 : minRect.Bottom = 1
+
+    SMALL_RECT maxRect
+    maxRect.Left = 0 : maxRect.Top = 0 : maxRect.Right = 79 : maxRect.Bottom = 26
+
+    IF hPlayBuffer <> -1 AND hPlayBuffer <> 0 THEN
+        SetConsoleCursorInfo(hPlayBuffer, &cInfo)
+        SetConsoleWindowInfo(hPlayBuffer, 1, &minRect)
+        SetConsoleScreenBufferSize(hPlayBuffer, newSize)
+        SetConsoleWindowInfo(hPlayBuffer, 1, &maxRect)
+
+        SetStdHandle(-11, hPlayBuffer)
+        SetConsoleActiveScreenBuffer(hPlayBuffer)
+        g_hConsole = hPlayBuffer
+    ELSE
+        g_hConsole = g_hStdOut
+    ENDIF
+
+    IF hOptionsBuffer <> -1 AND hOptionsBuffer <> 0 THEN
+        SetConsoleCursorInfo(hOptionsBuffer, &cInfo)
+        SetConsoleWindowInfo(hOptionsBuffer, 1, &minRect)
+        SetConsoleScreenBufferSize(hOptionsBuffer, newSize)
+        SetConsoleWindowInfo(hOptionsBuffer, 1, &maxRect)
+    ENDIF
+
+    IF hMoreOptionsBuffer <> -1 AND hMoreOptionsBuffer <> 0 THEN
+        SetConsoleCursorInfo(hMoreOptionsBuffer, &cInfo)
+        SetConsoleWindowInfo(hMoreOptionsBuffer, 1, &minRect)
+        SetConsoleScreenBufferSize(hMoreOptionsBuffer, newSize)
+        SetConsoleWindowInfo(hMoreOptionsBuffer, 1, &maxRect)
+    ENDIF
+ENDSUB
+
+SUB RestoreConsoleScreen()
+    IF g_hStdOut <> 0 THEN
+        SetStdHandle(-11, g_hStdOut)
+        SetConsoleActiveScreenBuffer(g_hStdOut)
+        IF hPlayBuffer <> 0 AND hPlayBuffer <> -1 THEN CloseHandle(hPlayBuffer) : hPlayBuffer = 0
+        IF hOptionsBuffer <> 0 AND hOptionsBuffer <> -1 THEN CloseHandle(hOptionsBuffer) : hOptionsBuffer = 0
+        IF hMoreOptionsBuffer <> 0 AND hMoreOptionsBuffer <> -1 THEN CloseHandle(hMoreOptionsBuffer) : hMoreOptionsBuffer = 0
+        g_hConsole = g_hStdOut
+    ENDIF
+ENDSUB
+
+SUB RedrawPlayerView()
+    IF hPlayBuffer = 0 OR hPlayBuffer = -1 THEN RETURN
+
+    ' Re-activate player console buffer
+    g_InOptionsView = 0
+    g_hConsole = hPlayBuffer
+    SetStdHandle(-11, hPlayBuffer)
+    SetConsoleActiveScreenBuffer(hPlayBuffer)
+
+    ' Repaint Static HUD
+    DrawStaticHUD()
+
+    ' Re-render Metadata & Specs (Using Global Buffers)
+    SetConsolePos(13, 2) : SetColor(colArtist) : PRINT g_DispArtist
+    SetConsolePos(13, 3) : SetColor(colTitle)  : PRINT g_DispTitle
+    SetConsolePos(13, 4) : SetColor(colAlbum)  : PRINT g_DispAlbum
+
+    SetConsolePos(13, 5) : SetColor(colVol)    : PRINT LEFT$(g_trackYear + SPACE$(21), 21)
+    SetConsolePos(42, 5) : SetColor(colVol)    : PRINT LEFT$(g_trackNum + SPACE$(24), 24)
+
+    STRING shufStr
+    IF g_Shuffle = 1 THEN shufStr = "ON " ELSE shufStr = "OFF"
+    SetConsolePos(13, 6) : SetColor(colQueue)
+    PRINT "[" + RIGHT$("     " + LTRIM$(STR$(argIdx + 1)), 5) + " / " + RIGHT$("     " + LTRIM$(STR$(g_TrackCount)), 5) + "]" + SPACE$(26) + "SHUFFLE: " + shufStr
+
+    SetConsolePos(13, 9)  : SetColor(colVol)  : PRINT LEFT$(g_SpecFmt + SPACE$(53), 53)
+    SetConsolePos(13, 10) : SetColor(colTech) : PRINT LEFT$(g_SpecBit + SPACE$(53), 53)
+    SetConsolePos(13, 11) : SetColor(colVol)  : PRINT LEFT$(g_SpecSiz + SPACE$(53), 53)
+
+    ' Re-render Comments / Lyrics / Extended HUD
+    RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+
+    ' Re-render Cover Art
+    Sleep(50)
+    DrawCoverArt(hStream, g_Playlist[argIdx])
+ENDSUB
+
+SUB SwitchToOptionsView()
+    IF hOptionsBuffer <> 0 AND hOptionsBuffer <> -1 THEN
+        ScanEQProfiles()
+        g_InOptionsView = 1
+        g_hConsole = hOptionsBuffer
+        SetStdHandle(-11, hOptionsBuffer)
+        SetConsoleActiveScreenBuffer(hOptionsBuffer)
+        DrawOptionsScreen()
+    ENDIF
+ENDSUB
+
+SUB SwitchToMoreOptionsView()
+    IF hMoreOptionsBuffer <> 0 AND hMoreOptionsBuffer <> -1 THEN
+        g_InOptionsView = 2
+        g_hConsole = hMoreOptionsBuffer
+        SetStdHandle(-11, hMoreOptionsBuffer)
+        SetConsoleActiveScreenBuffer(hMoreOptionsBuffer)
+        DrawMoreOptionsScreen()
+    ENDIF
+ENDSUB
+
+SUB DrawOptionsScreen()
+    CLS
+    
+    ' Top Banner
+    SetColor(C_WHITE + (C_DARK_BLUE * 16))
+    SetConsolePos(0, 0)
+    PRINT "--[ EQUALIZER & DSP ]" + STRING$(59, 196)
+
+    ' ========================================================================
+    ' 1. TOP-LEFT LISTBOX: AUDIO DSP MODULES (g_OptionsFocus = 0)
+    ' ========================================================================
+    SetConsolePos(2, 1)
+    IF g_OptionsFocus = 0
+       SetColor(C_YELLOW)
+       PRINT "[ Audio DSP Modules ]"
+    ELSE
+       SetColor(C_WHITE)
+       PRINT "  Audio DSP Modules  "
+    ENDIF
+
+    STRING dspNames[6]
+    INT dspStates[6]
+    dspNames[0] = "Master 10-Band EQ"  : dspStates[0] = g_EqEnabled
+    dspNames[1] = "Volume Normalization": dspStates[1] = g_NormEnabled
+    dspNames[2] = "Dynamic Compressor"  : dspStates[2] = g_CompEnabled
+    dspNames[3] = "Acoustic Decay (Reverb)": dspStates[3] = g_ReverbEnabled
+    dspNames[4] = "Vacuum Tube Warmth"  : dspStates[4] = g_TubeEnabled
+    dspNames[5] = "Stereo 3D Widener"   : dspStates[5] = g_WidenerEnabled
+
+    INT i, rowY, isSel
+    STRING statusStr, rowText
+
+    FOR i = 0 TO 5
+        rowY = 2 + i
+        SetConsolePos(2, rowY)
+        isSel = (i = g_DspSelectedIndex)
+
+        IF dspStates[i] = 1 THEN statusStr = "[ON]" ELSE statusStr = "[OFF]"
+        rowText = " " + LEFT$(dspNames[i] + SPACE$(24), 24) + " " + statusStr
+
+        IF isSel THEN
+            IF g_OptionsFocus = 0 THEN
+                IF dspStates[i] = 1 THEN SetColor(C_BLACK + (C_GREEN * 16)) ELSE SetColor(C_BLACK + (C_CYAN * 16))
+            ELSE
+                SetColor(C_BLACK + (C_DARK_GRAY * 16))
+            ENDIF
+        ELSE
+            IF dspStates[i] = 1 THEN SetColor(C_GREEN) ELSE SetColor(C_LIGHT_GRAY)
+        ENDIF
+
+        PRINT LEFT$(rowText + SPACE$(35), 35)
+    NEXT i
+
+    ' ========================================================================
+    ' 2. BOTTOM-LEFT LISTBOX: PRESET SELECTION (g_OptionsFocus = 1)
+    ' ========================================================================
+    SetConsolePos(2, 9)
+    IF g_OptionsFocus = 1
+      SetColor(C_YELLOW) : PRINT "[ Presets in .\\EQ\\ ]"
+    ELSE
+      SetColor(C_WHITE) : PRINT "  Presets in .\\EQ\\  "
+    ENDIF
+
+    INT visibleCount = 10
+    INT startIdx = 0
+    IF g_EqSelectedIndex >= visibleCount THEN startIdx = g_EqSelectedIndex - visibleCount + 1
+
+    INT itemIdx, isApplied
+    STRING lineStr
+
+    FOR i = 0 TO visibleCount - 1
+        itemIdx = startIdx + i
+        rowY = 10 + i
+        SetConsolePos(2, rowY)
+        
+        IF itemIdx < g_EqFileCount THEN
+            isApplied = 0
+            IF LCASE$(g_EqFileList[itemIdx]) = LCASE$(g_EqProfile) THEN isApplied = 1
+
+            IF itemIdx = g_EqSelectedIndex THEN
+                IF g_OptionsFocus = 1 THEN
+                    IF isApplied = 1 THEN SetColor(C_BLACK + (C_GREEN * 16)) ELSE SetColor(C_BLACK + (C_CYAN * 16))
+                ELSE
+                    SetColor(C_BLACK + (C_DARK_GRAY * 16))
+                ENDIF
+            ELSE
+                IF isApplied = 1 THEN SetColor(C_GREEN) ELSE SetColor(C_LIGHT_GRAY)
+            ENDIF
+
+            lineStr = " " + g_EqFileList[itemIdx]
+            IF isApplied = 1 THEN lineStr = " [" + g_EqFileList[itemIdx] + "]"
+            PRINT LEFT$(lineStr + SPACE$(35), 35)
+        ELSE
+            SetColor(C_BLACK)
+            PRINT SPACE$(35)
+        ENDIF
+    NEXT i
+
+    ' ========================================================================
+    ' 3. BOTTOM-LEFT: SAVE PRESET PROMPT
+    ' ========================================================================
+    IF g_SavePromptActive = 1 THEN
+        SetConsolePos(2, 21) : SetColor(C_YELLOW) : PRINT "Save preset name ?"
+        SetConsolePos(2, 22) : SetColor(C_BLACK + (C_WHITE * 16))
+        PRINT "> " + LEFT$(g_SaveNameBuf + "_" + SPACE$(33), 33)
+        SetColor(C_LIGHT_GRAY)
+    ENDIF
+
+    ' ========================================================================
+    ' 4. RIGHT PANEL: 10-BAND EQ PARAMETER FORM (g_OptionsFocus = 2)
+    ' ========================================================================
+    DrawEqNumericForm()
+    DrawEqResponseGraph()
+
+    ' Footer Hotkeys
+    SetColor(C_WHITE + (C_DARK_BLUE * 16))
+    SetConsolePos(0, 24)
+    IF g_SavePromptActive = 1 THEN
+        PRINT " [Enter] Save Preset | [Esc] Cancel Prompt | [Backspace] Delete" + SPACE$(17)
+    ELSE
+        PRINT " [Tab] Cycle Panel | [Space] Toggle/dB | [S]ave | [M]ore | [Esc] Back" + SPACE$(11)
+    ENDIF
+    SetColor(C_LIGHT_GRAY)
+ENDSUB
+
+' ----------------------------------------------------------------------------
+' 10-Band ISO Graphic Equalizer Engine
+' ----------------------------------------------------------------------------
+SUB InitEQFrequencies()
+    g_EqFreqs[0] = 31.0
+    g_EqFreqs[1] = 62.0
+    g_EqFreqs[2] = 125.0
+    g_EqFreqs[3] = 250.0
+    g_EqFreqs[4] = 500.0
+    g_EqFreqs[5] = 1000.0
+    g_EqFreqs[6] = 2000.0
+    g_EqFreqs[7] = 4000.0
+    g_EqFreqs[8] = 8000.0
+    g_EqFreqs[9] = 16000.0
+ENDSUB
+
+SUB Parse10BandEQConfig(STRING eqName), INT
+    FILE hF
+    STRING cleanName = LTRIM$(RTRIM$(eqName))
+    IF cleanName = "" THEN RETURN 0
+
+    ' Guarantee .eq extension
+    IF LCASE$(RIGHT$(cleanName, 3)) <> ".eq" THEN cleanName = cleanName + ".eq"
+
+    STRING eqPath = GETSTARTPATH() + "EQ\\" + cleanName
+    STRING lineStr, keyStr, valStr, tokenStr
+    INT colonPos = 0, commaPos = 0, i = 0
+    
+    g_EqPrecut = 0.0
+    FOR i = 0 TO 9 : g_EqGains[i] = 0.0 : NEXT i
+
+    IF OPENFILE(hF, eqPath, "R") <> 0 THEN RETURN 0
+
+    WHILE READ(hF, lineStr) = 0
+        lineStr = LCASE$(LTRIM$(RTRIM$(lineStr)))
+        colonPos = INSTR(lineStr, ":")
+        
+        IF colonPos > 0 THEN
+            keyStr = LTRIM$(RTRIM$(LEFT$(lineStr, colonPos - 1)))
+            valStr = LTRIM$(RTRIM$(RIGHT$(lineStr, LEN(lineStr) - colonPos)))
+
+            IF keyStr = "precut" THEN
+                g_EqPrecut = VAL(valStr)
+            ELSEIF keyStr = "bands" THEN
+                FOR i = 0 TO 9
+                    commaPos = INSTR(valStr, ",")
+                    IF commaPos > 0 THEN
+                        tokenStr = LTRIM$(RTRIM$(LEFT$(valStr, commaPos - 1)))
+                        valStr   = LTRIM$(RTRIM$(RIGHT$(valStr, LEN(valStr) - commaPos)))
+                    ELSE
+                        tokenStr = valStr
+                        valStr   = ""
+                    ENDIF
+                    g_EqGains[i] = VAL(tokenStr)
+                NEXT i
+            ENDIF
+        ENDIF
+    ENDWHILE
+
+    CLOSEFILE(hF)
+    RETURN 1
+ENDSUB
+
+SUB ClearActiveEqFX(DWORD hStreamHandle)
+    INT i
+    FOR i = 0 TO 9
+        IF g_hEqFX[i] <> 0 THEN
+            BASS_ChannelRemoveFX(hStreamHandle, g_hEqFX[i])
+            g_hEqFX[i] = 0
+        ENDIF
+    NEXT i
+ENDSUB
+
+SUB ScanEQProfiles()
+    STRING eqDir = GETSTARTPATH() + "EQ\\"
+    STRING fullPath = ""
+    STRING prevSelected = ""
+
+    ' Preserve current user selection if already browsing Options View
+    IF g_InOptionsView = 1 AND g_EqFileCount > 0 AND g_EqSelectedIndex < g_EqFileCount THEN
+        prevSelected = g_EqFileList[g_EqSelectedIndex]
+    ENDIF
+
+    g_EqFileCount = 0
+
+    DynaStore fileList
+    DynaNew(fileList, 50, 50)
+    INT totalFiles = GetDynaFileList(fileList, eqDir, "eq", 1)
+    INT i
+
+    FOR i = 0 TO totalFiles - 1
+        IF g_EqFileCount < 50 THEN
+            DynaGetStr(fileList, i, fullPath)
+            g_EqFileList[g_EqFileCount] = GetFileNameOnly(fullPath)
+            g_EqFileCount = g_EqFileCount + 1
+        ENDIF
+    NEXT i
+    DynaDelete(fileList)
+
+    ' Restore user selection if still present in directory
+    IF prevSelected <> "" THEN
+        FOR i = 0 TO g_EqFileCount - 1
+            IF LCASE$(g_EqFileList[i]) = LCASE$(prevSelected) THEN
+                g_EqSelectedIndex = i
+                Parse10BandEQConfig(g_EqFileList[g_EqSelectedIndex])
+                RETURN
+            ENDIF
+        NEXT i
+    ENDIF
+
+    ' Initial entry / Fallback sync to active g_EqProfile
+    g_EqSelectedIndex = 0
+    FOR i = 0 TO g_EqFileCount - 1
+        IF LCASE$(g_EqFileList[i]) = LCASE$(g_EqProfile) OR LCASE$(g_EqFileList[i]) = LCASE$(g_EqProfile + ".eq") THEN
+            g_EqSelectedIndex = i
+            BREAK
+        ENDIF
+    NEXT i
+
+    ' Force-load active gains array into memory
+    IF g_EqFileCount > 0 THEN
+        Parse10BandEQConfig(g_EqFileList[g_EqSelectedIndex])
+    ENDIF
+ENDSUB
+
+SUB Save10BandEQConfig(STRING eqName), INT
+    FILE hF
+    STRING cleanName = LTRIM$(RTRIM$(eqName))
+    IF cleanName = "" THEN RETURN 0
+
+    ' Ensure .eq extension
+    IF LCASE$(RIGHT$(cleanName, 3)) <> ".eq" THEN cleanName = cleanName + ".eq"
+
+    STRING eqPath = GETSTARTPATH() + "EQ\\" + cleanName
+    INT i
+
+    IF OPENFILE(hF, eqPath, "W") = 0 THEN
+        WRITE hF, "precut: " + LTRIM$(STR$(g_EqPrecut))
+        
+        STRING bandsStr = "bands: "
+        FOR i = 0 TO 9
+            bandsStr = bandsStr + LTRIM$(STR$(g_EqGains[i]))
+            IF i < 9 THEN bandsStr = bandsStr + ", "
+        NEXT i
+        WRITE hF, bandsStr
+        
+        CLOSEFILE(hF)
+        
+        ' Update active profile & rescan directory
+        g_EqProfile = cleanName
+        ScanEQProfiles()
+        RETURN 1
+    ENDIF
+
+    RETURN 0
+ENDSUB
+
+SUB RecalculateEqPrecut()
+    INT idx
+    DOUBLE maxGain = 0.0
+
+    ' Find peak positive gain across all 10 bands
+    FOR idx = 0 TO 9
+        IF g_EqGains[idx] > maxGain THEN maxGain = g_EqGains[idx]
+    NEXT idx
+
+    ' Headroom attenuation must be negative (or 0.0)
+    IF maxGain > 0.0 THEN
+        g_EqPrecut = -maxGain
+    ELSE
+        g_EqPrecut = 0.0
+    ENDIF
+ENDSUB
+
+SUB UpdateBASSBand(INT bandIdx)
+    ' Guard against uninitialized stream or invalid band index
+    IF hStream = 0 OR bandIdx < 0 OR bandIdx > 9 THEN RETURN
+    IF g_hEqFX[bandIdx] = 0 THEN RETURN
+
+    BASS_DX8_PARAMEQ eqParams
+
+    ' Retrieve current band parameters, adjust gain using native IWBasic float() casting
+    IF BASS_FXGetParameters(g_hEqFX[bandIdx], &eqParams) <> 0 THEN
+        eqParams.fGain = float(g_EqGains[bandIdx] - g_EqPrecut)
+        BASS_FXSetParameters(g_hEqFX[bandIdx], &eqParams)
+    ENDIF
+ENDSUB
+
+SUB UpdateStreamVolume(DWORD hStreamHandle)
+    IF hStreamHandle = 0 THEN RETURN
+    INT curFreq, curVol, curPan
+    BASS_ChannelGetAttributes(hStreamHandle, &curFreq, &curVol, &curPan)
+    
+    DOUBLE effVol = g_Volume
+    IF g_EqEnabled = 1 AND g_EqPrecut < 0.0 THEN
+        DOUBLE scaleFactor = 10.0 ^ (g_EqPrecut / 20.0)
+        effVol = g_Volume * scaleFactor
+    ENDIF
+    
+    INT finalVol = INT(effVol)
+    IF finalVol < 0 THEN finalVol = 0
+    IF finalVol > 100 THEN finalVol = 100
+    
+    BASS_ChannelSetAttributes(hStreamHandle, curFreq, finalVol, curPan)
+ENDSUB
+
+SUB ApplyEqProfile(DWORD hStreamHandle)
+    ClearActiveEqFX(hStreamHandle)
+
+    IF g_EqEnabled = 0 OR hStreamHandle = 0 THEN
+        UpdateStreamVolume(hStreamHandle)
+        RETURN
+    ENDIF
+
+    Parse10BandEQConfig(g_EqProfile)
+
+    ' Automatic safety precut headroom calculation
+    DOUBLE maxBoost = 0.0
+    INT i
+    FOR i = 0 TO 9
+        IF g_EqGains[i] > maxBoost THEN maxBoost = g_EqGains[i]
+    NEXT i
+    
+    IF g_EqPrecut = 0.0 AND maxBoost > 0.0 THEN
+        g_EqPrecut = -maxBoost
+    ENDIF
+
+    UpdateStreamVolume(hStreamHandle)
+
+    BASS_DX8_PARAMEQ eqParams
+    INT fxCount = 0
+
+    FOR i = 0 TO 9
+        FLOAT fG = g_EqGains[i]
+        
+        ' Clamp Gain (-15.0 dB to +15.0 dB)
+        IF fG < -15.0 THEN fG = -15.0
+        IF fG > 15.0 THEN fG = 15.0
+
+        ' Only attach DX8 FX handle when gain is non-zero
+        IF ABS(fG) > 0.1 THEN
+            g_hEqFX[fxCount] = BASS_ChannelSetFX(hStreamHandle, BASS_FX_DX8_PARAMEQ, 0)
+            IF g_hEqFX[fxCount] <> 0 THEN
+                FLOAT fC = g_EqFreqs[i]
+                IF fC < 80.0 THEN fC = 80.0
+                IF fC > 16000.0 THEN fC = 16000.0
+
+                eqParams.fCenter    = fC
+                eqParams.fBandwidth = 12.0 ' 1-Octave bandwidth
+                eqParams.fGain      = fG
+
+                BASS_FXSetParameters(g_hEqFX[fxCount], &eqParams)
+                fxCount = fxCount + 1
+            ENDIF
+        ENDIF
+    NEXT i
+ENDSUB
+
+SUB ApplyAudioAttributes(DWORD hStream)
+    IF hStream = 0 THEN RETURN
+    
+    ' BASS_ChannelSetAttributes(handle, freq, volume, pan)
+    ' -1 for freq/volume leaves current values untouched.
+    ' g_Balance ranges directly from -100 (Full L) to +100 (Full R).
+    BASS_ChannelSetAttributes(hStream, -1, -1, g_Balance)
+ENDSUB
+
+SUB PreloadNextTrack(INT currentIdx)
+    ' Trace("PreloadNextTrack: Triggered for currentIdx = " + LTRIM$(STR$(currentIdx)))
+
+    IF g_hNextStream <> 0 THEN
+        ' Trace("PreloadNextTrack: Freeing previous secondary stream handle " + LTRIM$(STR$(g_hNextStream)))
+        BASS_StreamFree(g_hNextStream)
+        g_hNextStream = 0
+    ENDIF
+
+    g_PreloadDone = 0
+    IF g_TrackCount <= 1 THEN
+        ' Trace("PreloadNextTrack: Track count <= 1, aborting preload.")
+        RETURN
+    ENDIF
+
+    IF g_Shuffle = 1 THEN
+        g_NextTrackIdx = RND(g_TrackCount - 1)
+    ELSE
+        g_NextTrackIdx = currentIdx + 1
+        IF g_NextTrackIdx >= g_TrackCount THEN g_NextTrackIdx = 0
+    ENDIF
+
+    ' Trace("PreloadNextTrack: Next track index = " + LTRIM$(STR$(g_NextTrackIdx)) + " | Path = " + g_Playlist[g_NextTrackIdx])
+
+    g_hNextStream = CreateTrackStream(g_Playlist[g_NextTrackIdx])
+    IF g_hNextStream <> 0 THEN
+        g_PreloadDone = 1
+        ' Trace("PreloadNextTrack: Preload COMPLETE. g_hNextStream = " + LTRIM$(STR$(g_hNextStream)))
+    ELSE
+        ' Trace("PreloadNextTrack: Preload FAILED!")
+    ENDIF
+ENDSUB
+
+SUB GetCalculatedVolume(), INT
+    DOUBLE effVol = g_Volume
+    IF g_EqEnabled = 1 AND g_EqPrecut < 0.0 THEN
+        DOUBLE scaleFactor = 10.0 ^ (g_EqPrecut / 20.0)
+        effVol = g_Volume * scaleFactor
+    ENDIF
+    INT finalVol = INT(effVol)
+    IF finalVol < 0 THEN finalVol = 0
+    IF finalVol > 100 THEN finalVol = 100
+    RETURN finalVol
+ENDSUB
+
+SUB CreateTrackStream(STRING filePath), DWORD
+    DWORD flags = BASS_STREAM_PRESCAN | BASS_UNICODE
+    IF g_MonoDownmix = 1 THEN flags = flags | BASS_SAMPLE_MONO
+
+    ' Trace("CreateTrackStream: File -> " + filePath)
+
+    POINTER pWideTrack = GetWideString(filePath)
+    DWORD newStream = 0
+
+    IF LCASE$(RIGHT$(filePath, 5)) = ".flac" THEN
+        newStream = BASS_FLAC_StreamCreateFile(0, pWideTrack, 0, 0, flags)
+    ELSE
+        newStream = BASS_StreamCreateFile(0, pWideTrack, 0, 0, flags)
+        IF newStream = 0 THEN
+            INT err1 = BASS_ErrorGetCode()
+            ' Trace("CreateTrackStream: Primary attempt failed (BASS Err " + LTRIM$(STR$(err1)) + "). Retrying without prescan...")
+            newStream = BASS_StreamCreateFile(0, pWideTrack, 0, 0, BASS_UNICODE | (flags & BASS_SAMPLE_MONO))
+        ENDIF
+    ENDIF
+
+    IF pWideTrack <> 0 THEN DELETE pWideTrack
+
+    IF newStream <> 0 THEN
+        ' Trace("CreateTrackStream: SUCCESS -> Stream Handle: " + LTRIM$(STR$(newStream)))
+        ApplyAudioAttributes(newStream)
+    ELSE
+        INT finalErr = BASS_ErrorGetCode()
+        ' Trace("CreateTrackStream: CRITICAL FAIL -> BASS Err Code: " + LTRIM$(STR$(finalErr)))
+    ENDIF
+
+    RETURN newStream
+ENDSUB
+
+SUB CheckStreamTransition(POINTER phStream, POINTER pargIdx)
+    DWORD hStream = #<DWORD>phStream
+    INT argIdx    = #<INT>pargIdx
+
+    IF hStream = 0 THEN RETURN
+
+    ' Clean up previously faded outgoing stream handle once stopped
+    IF g_hOldFadingStream <> 0 THEN
+        IF BASS_ChannelIsActive(g_hOldFadingStream) <> BASS_ACTIVE_PLAYING THEN
+            ' Trace("CheckStreamTransition: Freeing finished old fading stream handle " + LTRIM$(STR$(g_hOldFadingStream)))
+            BASS_StreamFree(g_hOldFadingStream)
+            g_hOldFadingStream = 0
+        ENDIF
+    ENDIF
+
+    totalLenBytes   = BASS_ChannelGetLength(hStream)
+    currentPosBytes = BASS_ChannelGetPosition(hStream)
+    
+    ' Accurate time calculation via channel sample rate & channels
+    BASS_ChannelGetInfo(hStream, &g_chanInfo)
+    DOUBLE totalS = 0.0, currentS = 0.0, remainS = 0.0
+
+    IF g_chanInfo.freq > 0 AND g_chanInfo.chans > 0 THEN
+        totalS   = totalLenBytes / (g_chanInfo.freq * g_chanInfo.chans * 2.0)
+        currentS = currentPosBytes / (g_chanInfo.freq * g_chanInfo.chans * 2.0)
+        remainS  = totalS - currentS
+    ENDIF
+
+    DOUBLE crossfadeSecs  = g_Crossfade * 1.0
+    DOUBLE preloadTrigger = 3.0
+    IF g_Crossfade > 0 THEN preloadTrigger = crossfadeSecs + 1.0
+
+    ' 1. Pre-load next track into background stream buffer
+    IF (g_Gapless = 1 OR g_Crossfade > 0) AND g_PreloadDone = 0 AND remainS <= preloadTrigger AND remainS > 0.0 THEN
+        ' Trace("CheckStreamTransition: Preload trigger hit! remainS = " + LTRIM$(STR$(INT(remainS))) + "s | PreloadTrigger = " + LTRIM$(STR$(INT(preloadTrigger))) + "s")
+        PreloadNextTrack(argIdx)
+    ENDIF
+
+    ' 2. Overlapped Dual-Stream Crossfade Transition
+    IF g_Crossfade > 0 AND g_hNextStream <> 0 AND remainS <= crossfadeSecs AND remainS > 0.0 THEN
+        ' Trace("CheckStreamTransition: CROSSFADE EXECUTING! remainS = " + LTRIM$(STR$(INT(remainS))) + "s | g_hNextStream = " + LTRIM$(STR$(g_hNextStream)))
+        
+        DWORD hOldStream = hStream
+        DWORD hNewStream = g_hNextStream
+        INT targetVol    = GetCalculatedVolume()
+        INT slideMs      = INT(remainS * 1000.0)
+        IF slideMs < 100 THEN slideMs = 100
+
+        ApplyAllDSP(hNewStream)
+
+        BASS_ChannelSetAttributes(hNewStream, -1, 0, g_Balance)
+        BASS_ChannelPlay(hNewStream, 0)
+        BASS_ChannelSlideAttributes(hNewStream, -1, targetVol, g_Balance, slideMs)
+
+        BASS_ChannelSlideAttributes(hOldStream, -1, 0, g_Balance, slideMs)
+
+        g_hOldFadingStream = hOldStream
+
+        #<DWORD>phStream = hNewStream
+        #<INT>pargIdx    = g_NextTrackIdx
+
+        g_hNextStream = 0
+        g_PreloadDone = 0
+
+        LoadTrackMetadata(hNewStream, g_NextTrackIdx)
+        RedrawCurrentScreen()
+
+    ' 3. Standard Zero-Delay Gapless Handoff
+    ELSEIF (remainS <= 0.08 OR BASS_ChannelIsActive(hStream) <> BASS_ACTIVE_PLAYING) THEN
+        IF g_Gapless = 1 AND g_hNextStream <> 0 THEN
+            ' Trace("CheckStreamTransition: GAPLESS HANDOFF EXECUTING!")
+            BASS_ChannelStop(hStream)
+            BASS_StreamFree(hStream)
+
+            #<DWORD>phStream = g_hNextStream
+            #<INT>pargIdx    = g_NextTrackIdx
+
+            hStream = g_hNextStream
+            argIdx  = g_NextTrackIdx
+
+            g_hNextStream = 0
+            g_PreloadDone = 0
+
+            ApplyAllDSP(hStream)
+            BASS_ChannelPlay(hStream, 0)
+
+            LoadTrackMetadata(hStream, argIdx)
+            RedrawCurrentScreen()
+        ENDIF
+    ENDIF
+ENDSUB
+
+' ----------------------------------------------------------------------------
+' Custom BASS_ChannelSetDSP Callbacks & Handlers
+' ----------------------------------------------------------------------------
+
+' 1. Analog Vacuum Tube Warmth (Polynomial Soft Clipper)
+SUB TubeWarmthDSP(DWORD hDSP, DWORD channel, POINTER pBuffer, DWORD length, DWORD user)
+    INT sampleCount = length / 2 ' 16-bit audio = 2 bytes per sample
+    INT i, sVal
+    POINTER pSamples = pBuffer
+    DOUBLE x, y
+
+    FOR i = 0 TO sampleCount - 1
+        sVal = #<WORD>pSamples[i]
+        IF sVal > 32767 THEN sVal = sVal - 65536
+
+        x = sVal / 32768.0
+        IF x > 1.0 THEN x = 1.0
+        IF x < -1.0 THEN x = -1.0
+
+        ' Non-linear saturation curve: y = 1.5 * (x - x^3 / 3)
+        y = 1.5 * (x - (x * x * x) / 3.0)
+
+        sVal = INT(y * 32767.0)
+        IF sVal > 32767 THEN sVal = 32767
+        IF sVal < -32768 THEN sVal = -32768
+
+        #<WORD>pSamples[i] = sVal
+    NEXT i
+ENDSUB
+
+' 2. Stereo 3D Widener (Mid-Side Matrixing)
+SUB StereoWidenerDSP(DWORD hDSP, DWORD channel, POINTER pBuffer, DWORD length, DWORD user)
+    INT frameCount = length / 4 ' 16-bit stereo = 4 bytes per frame (2L + 2R)
+    INT i, lVal, rVal, midVal, sideVal, lOut, rOut
+    POINTER pSamples = pBuffer
+
+    FOR i = 0 TO frameCount - 1
+        lVal = #<WORD>pSamples[i * 2]
+        IF lVal > 32767 THEN lVal = lVal - 65536
+        rVal = #<WORD>pSamples[i * 2 + 1]
+        IF rVal > 32767 THEN rVal = rVal - 65536
+
+        midVal  = (lVal + rVal) / 2
+        sideVal = INT(((lVal - rVal) / 2.0) * 1.6) ' Boost Side component
+
+        lOut = midVal + sideVal
+        rOut = midVal - sideVal
+
+        IF lOut > 32767 THEN lOut = 32767
+        IF lOut < -32768 THEN lOut = -32768
+        IF rOut > 32767 THEN rOut = 32767
+        IF rOut < -32768 THEN rOut = -32768
+
+        #<WORD>pSamples[i * 2]     = lOut
+        #<WORD>pSamples[i * 2 + 1] = rOut
+    NEXT i
+ENDSUB
+
+' DSP Attachment Handlers
+SUB ApplyTubeWarmth(DWORD hStreamHandle)
+    IF hStreamHandle = 0 THEN RETURN
+    IF g_hTubeDSP <> 0 THEN
+        BASS_ChannelRemoveDSP(hStreamHandle, g_hTubeDSP)
+        g_hTubeDSP = 0
+    ENDIF
+    IF g_TubeEnabled = 1 THEN
+        g_hTubeDSP = BASS_ChannelSetDSP(hStreamHandle, &TubeWarmthDSP, 0, 0)
+    ENDIF
+ENDSUB
+
+SUB ApplyStereoWidener(DWORD hStreamHandle)
+    IF hStreamHandle = 0 THEN RETURN
+    IF g_hWidenerDSP <> 0 THEN
+        BASS_ChannelRemoveDSP(hStreamHandle, g_hWidenerDSP)
+        g_hWidenerDSP = 0
+    ENDIF
+    IF g_WidenerEnabled = 1 THEN
+        g_hWidenerDSP = BASS_ChannelSetDSP(hStreamHandle, &StereoWidenerDSP, 0, 0)
+    ENDIF
+ENDSUB
+
+SUB ApplyCompressor(DWORD hStreamHandle)
+    IF hStreamHandle = 0 THEN RETURN
+
+    IF g_hCompFX <> 0 THEN
+        BASS_ChannelRemoveFX(hStreamHandle, g_hCompFX)
+        g_hCompFX = 0
+    ENDIF
+
+    IF g_CompEnabled = 1 THEN
+        g_hCompFX = BASS_ChannelSetFX(hStreamHandle, BASS_FX_DX8_COMPRESSOR, 1)
+        IF g_hCompFX <> 0 THEN
+            BASS_DX8_COMPRESSOR compParams
+            compParams.fGain      = 0.0
+            compParams.fAttack    = 10.0   ' Fast attack for transient control
+            compParams.fRelease   = 200.0  ' Smooth release
+            compParams.fThreshold = -16.0  ' Moderate compression threshold
+            compParams.fRatio     = 4.0    ' 4:1 musical compression ratio
+            compParams.fPredelay  = 4.0
+            BASS_FXSetParameters(g_hCompFX, &compParams)
+        ENDIF
+    ENDIF
+ENDSUB
+
+SUB ApplyReverb(DWORD hStreamHandle)
+    IF hStreamHandle = 0 THEN RETURN
+
+    IF g_hReverbFX <> 0 THEN
+        BASS_ChannelRemoveFX(hStreamHandle, g_hReverbFX)
+        g_hReverbFX = 0
+    ENDIF
+
+    IF g_ReverbEnabled = 1 THEN
+        g_hReverbFX = BASS_ChannelSetFX(hStreamHandle, BASS_FX_DX8_REVERB, 2)
+        IF g_hReverbFX <> 0 THEN
+            BASS_DX8_REVERB revParams
+            revParams.fInGain          = 0.0
+            revParams.fReverbMix       = -12.0  ' Natural ambient mix level (-12 dB)
+            revParams.fReverbTime      = 1100.0 ' 1.1 second decay time
+            revParams.fHighFreqRHRatio = 0.001
+            BASS_FXSetParameters(g_hReverbFX, &revParams)
+        ENDIF
+    ENDIF
+ENDSUB
+
+' Updated Master DSP Dispatcher
+SUB ApplyAllDSP(DWORD hStreamHandle)
+    ApplyEqProfile(hStreamHandle)
+    ApplyCompressor(hStreamHandle)
+    ApplyReverb(hStreamHandle)
+    ApplyTubeWarmth(hStreamHandle)
+    ApplyStereoWidener(hStreamHandle)
+ENDSUB
+
+SUB EnsureDefaultEQProfiles()
+    STRING eqDir = GETSTARTPATH() + "EQ\\"
+    STRING filePath = ""
+    FILE hF
+
+    INT attr = GetFileAttributesA(eqDir)
+    IF attr = -1 OR (attr & 0x10) = 0 THEN
+        CreateDirectoryA(eqDir, 0)
+    ENDIF
+
+    ' 1. Flat.eq
+    filePath = eqDir + "Flat.eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: 0.0"
+            WRITE hF, "bands: 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+
+    ' 2. Harman Target.eq
+    filePath = eqDir + "Harman Target.eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: -5.0"
+            WRITE hF, "bands: 5.0, 4.0, 1.5, 0.0, 0.0, 0.5, 2.0, 3.0, 1.0, -1.0"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+
+    ' 3. Diffuse Field.eq
+    filePath = eqDir + "Diffuse Field.eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: -6.0"
+            WRITE hF, "bands: 0.0, 0.0, 0.0, 0.5, 1.0, 2.0, 4.5, 6.0, 2.5, 0.0"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+
+    ' 4. V-Shape Dynamic.eq
+    filePath = eqDir + "V-Shape Dynamic.eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: -5.5"
+            WRITE hF, "bands: 5.5, 4.5, 2.0, -1.0, -2.5, -2.0, 0.0, 2.0, 4.0, 5.0"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+
+    ' 5. Electronic EDM.eq
+    filePath = eqDir + "Electronic EDM.eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: -6.0"
+            WRITE hF, "bands: 6.0, 5.0, 3.0, 0.0, -1.5, -1.0, 1.0, 2.5, 4.0, 4.5"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+
+    ' 6. Bass Boost.eq
+    filePath = eqDir + "Bass Boost.eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: -5.0"
+            WRITE hF, "bands: 5.0, 4.5, 3.5, 2.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+
+    ' 7. Rock.eq
+    filePath = eqDir + "Rock.eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: -4.5"
+            WRITE hF, "bands: 4.5, 3.5, 2.0, -1.0, -2.0, -1.0, 1.0, 2.5, 3.5, 4.0"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+
+    ' 8. Vocal & Clarity.eq
+    filePath = eqDir + "Vocal & Clarity.eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: -3.5"
+            WRITE hF, "bands: -3.0, -2.0, -1.0, 0.5, 2.0, 3.5, 3.0, 2.0, 1.0, 0.0"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+
+    ' 9. Acoustic.eq
+    filePath = eqDir + "Acoustic.eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: -3.0"
+            WRITE hF, "bands: 1.5, 2.0, 1.0, 0.0, 1.0, 1.5, 2.0, 2.5, 3.0, 2.0"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+
+' 10. Flathead Earbuds.eq
+    filePath = eqDir + "Flathead Earbuds.eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: -6.0"
+            WRITE hF, "bands: 6.0, 5.0, 3.0, 1.0, 0.0, -1.0, -0.5, 1.0, 2.5, 3.0"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+
+    ' 11. In-Ear Monitors (IEM).eq
+    filePath = eqDir + "In-Ear Monitors (IEM).eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: -3.5"
+            WRITE hF, "bands: 3.5, 2.5, 1.0, -1.5, -1.0, 0.5, 2.0, 1.5, -2.0, 1.0"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+
+    ' 12. Over-Ear Headphones.eq
+    filePath = eqDir + "Over-Ear Headphones.eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: -1.5"
+            WRITE hF, "bands: 1.0, 0.5, 0.0, 0.0, -0.5, 0.0, 1.0, -1.5, -1.0, 1.5"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+
+    ' 13. Late Night Loudness.eq
+    filePath = eqDir + "Late Night Loudness.eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: -4.5"
+            WRITE hF, "bands: 4.5, 3.5, 2.0, 0.5, -0.5, 0.0, 0.5, 1.5, 3.0, 4.0"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+
+    ' 14. Laptop Speakers.eq
+    filePath = eqDir + "Laptop Speakers.eq"
+    IF OPENFILE(hF, filePath, "R") <> 0 THEN
+        IF OPENFILE(hF, filePath, "W") = 0 THEN
+            WRITE hF, "precut: -3.5"
+            WRITE hF, "bands: -6.0, -4.0, 2.0, 3.5, 2.5, 1.5, 2.0, 3.0, 2.5, 1.0"
+            CLOSEFILE(hF)
+        ENDIF
+    ELSE : CLOSEFILE(hF) : ENDIF
+ENDSUB
+
+' ----------------------------------------------------------------------------
+' Trace Subroutine
+' ----------------------------------------------------------------------------
+SUB Trace(STRING msg$)
+    OutputDebugStringA("[CPlay Trace] " + msg$ + "\n")
+ENDSUB
+
+' ----------------------------------------------------------------------------
+' UI & Formatting Helpers
+' ----------------------------------------------------------------------------
+SUB SetConsolePos(INT x, INT y)
+    COORD pos
+    pos.X = x : pos.Y = y
+    SetConsoleCursorPosition(g_hConsole, pos)
+ENDSUB
+
+SUB SetColor(INT colorAttr)
+    SetConsoleTextAttribute(g_hConsole, colorAttr)
+ENDSUB
+
+SUB ConsoleWrite(INT x, INT y, STRING txt$)
+    COORD pos
+    pos.X = x : pos.Y = y
+    SetConsoleCursorPosition(g_hConsole, pos)
+    DWORD written = 0
+    WriteConsoleA(g_hConsole, txt$, LEN(txt$), &written, 0)
+ENDSUB
+
+SUB FormatTimeStr(DOUBLE totalSeconds), STRING
+    INT secs = INT(totalSeconds)
+    INT mins = INT(secs / 60)
+    INT hrs = INT(mins / 60)
+    mins = mins - (hrs * 60)
+    secs = secs - (mins * 60) - (hrs * 3600)
+    
+    STRING minStr = LTRIM$(STR$(mins))
+    IF mins < 10 THEN minStr = "0" + minStr
+    STRING secStr = LTRIM$(STR$(secs))
+    IF secs < 10 THEN secStr = "0" + secStr
+    
+    STRING retStr = ""
+    IF hrs > 0 THEN
+        STRING hrStr = LTRIM$(STR$(hrs))
+        IF hrs < 10 THEN hrStr = "0" + hrStr
+        retStr = hrStr + ":" + minStr + ":" + secStr
+    ELSE
+        retStr = minStr + ":" + secStr
+    ENDIF
+    
+    RETURN retStr
+ENDSUB
+
+SUB GetFileNameOnly(STRING fullPath), STRING
+    INT i
+    FOR i = LEN(fullPath) TO 1 STEP -1
+        IF MID$(fullPath, i, 1) = "\\" OR MID$(fullPath, i, 1) = "/" THEN
+            RETURN RIGHT$(fullPath, LEN(fullPath) - i)
+        ENDIF
+    NEXT i
+    RETURN fullPath
+ENDSUB
+
+' ----------------------------------------------------------------------------
+' Encoding & Codepage Handlers
+' ----------------------------------------------------------------------------
+SUB GetWideString(STRING cinstr), POINTER
+    ' 1. Convert incoming ANSI or UTF-8 string to raw UTF-16 WideChar
+    INT wLen = MultiByteToWideChar(65001, 8, cinstr, -1, 0, 0) ' CP_UTF8, MB_ERR_INVALID_CHARS
+    INT isUtf8 = 1
+    
+    IF wLen <= 0 THEN
+        wLen = MultiByteToWideChar(0, 0, cinstr, -1, 0, 0) ' CP_ACP
+        isUtf8 = 0
+    ENDIF
+    IF wLen <= 0 THEN RETURN 0
+
+    POINTER pWideRaw = NEW(CHAR, wLen * 2)
+    IF isUtf8 = 1 THEN
+        MultiByteToWideChar(65001, 8, cinstr, -1, pWideRaw, wLen)
+    ELSE
+        MultiByteToWideChar(0, 0, cinstr, -1, pWideRaw, wLen)
+    ENDIF
+
+    ' 2. Normalize UTF-16 string from NFD (decomposed e + ´) -> NFC (composed é) for NTFS
+    INT normLen = NormalizeString(NormalizationC, pWideRaw, wLen, 0, 0)
+    IF normLen <= 0 THEN
+        ' If normalization fails, return raw UTF-16 buffer
+        RETURN pWideRaw
+    ENDIF
+
+    POINTER pWideNFC = NEW(CHAR, normLen * 2)
+    IF NormalizeString(NormalizationC, pWideRaw, wLen, pWideNFC, normLen) > 0 THEN
+        DELETE pWideRaw
+        RETURN pWideNFC
+    ENDIF
+
+    DELETE pWideNFC
+    RETURN pWideRaw
+ENDSUB
+
+SUB NormalizeToNFC(STRING NinStr), STRING
+    ' Convert string to UTF-16 WideChar
+    INT wLen = MultiByteToWideChar(65001, 0, NinStr, -1, 0, 0)
+    IF wLen <= 0 THEN wLen = MultiByteToWideChar(0, 0, NinStr, -1, 0, 0)
+    IF wLen <= 0 THEN RETURN NinStr
+
+    POINTER pWideSrc = NEW(CHAR, wLen * 2)
+    MultiByteToWideChar(65001, 0, NinStr, -1, pWideSrc, wLen)
+
+    ' Query required destination buffer size for NFC conversion
+    INT normLen = NormalizeString(NormalizationC, pWideSrc, wLen, 0, 0)
+    IF normLen <= 0 THEN
+        DELETE pWideSrc
+        RETURN NinStr
+    ENDIF
+
+    POINTER pWideDst = NEW(CHAR, normLen * 2)
+    NormalizeString(NormalizationC, pWideSrc, wLen, pWideDst, normLen)
+    DELETE pWideSrc
+
+    ' Convert normalized UTF-16 back to ANSI
+    INT aLen = WideCharToMultiByte(0, 0, pWideDst, normLen, 0, 0, 0, 0)
+    POINTER pAnsiDst = NEW(CHAR, aLen)
+    WideCharToMultiByte(0, 0, pWideDst, normLen, pAnsiDst, aLen, 0, 0)
+    DELETE pWideDst
+
+    STRING result = #<STRING>pAnsiDst
+    DELETE pAnsiDst
+    RETURN result
+ENDSUB
+
+SUB ConvertANSItoOEM(STRING cinstr), STRING
+    INT inLen = LEN(cinstr)
+    IF inLen = 0 THEN RETURN ""
+    POINTER pOem = NEW(CHAR, inLen + 1)
+    CharToOemA(cinstr, pOem)
+    STRING result = #<STRING>pOem
+    DELETE pOem
+    RETURN result
+ENDSUB
+
+SUB EnsureANSI(STRING UinStr), STRING
+    INT wLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, UinStr, -1, 0, 0)
+    IF wLen > 0 THEN
+        POINTER pWide = NEW(CHAR, wLen * 2)
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, UinStr, -1, pWide, wLen)
+        INT aLen = WideCharToMultiByte(CP_ACP, 0, pWide, -1, 0, 0, 0, 0)
+        POINTER pAnsi = NEW(CHAR, aLen)
+        WideCharToMultiByte(CP_ACP, 0, pWide, -1, pAnsi, aLen, 0, 0)
+        STRING outStr = #<STRING>pAnsi
+        DELETE pWide : DELETE pAnsi
+        RETURN outStr
+    ENDIF
+    RETURN UinStr
+ENDSUB
+
+SUB EnsureANSI_InPlace(POINTER pDest, INT maxLen)
+    INT wLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pDest, -1, 0, 0)
+    IF wLen > 0 THEN
+        POINTER pWide = NEW(CHAR, wLen * 2)
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pDest, -1, pWide, wLen)
+        WideCharToMultiByte(CP_ACP, 0, pWide, -1, pDest, maxLen, 0, 0)
+        DELETE pWide
+    ENDIF
+ENDSUB
+
+SUB ConvertANSItoOEM_InPlace(POINTER pDest)
+    CharToOemA(pDest, pDest)
+ENDSUB
+
+' ----------------------------------------------------------------------------
+' Pointer-Based Long Text Utilities
+' ----------------------------------------------------------------------------
+SUB GetTotalLinesPtr(POINTER pText), INT
+    INT i = 0, count = 1
+    IF #<BYTE>pText[0] = 0 THEN RETURN 0
+    WHILE #<BYTE>pText[i] <> 0
+        IF #<BYTE>pText[i] = 10 THEN count = count + 1
+        i = i + 1
+    ENDWHILE
+    RETURN count
+ENDSUB
+
+SUB WrapText_InPlace(POINTER pDest, INT maxWidth, INT maxLen)
+    POINTER pTemp = NEW(CHAR, maxLen)
+    INT rPos = 0, wPos = 0
+    INT lineLen = 0, lastSpaceW = -1, b
+
+    WHILE #<BYTE>pDest[rPos] <> 0 AND wPos < maxLen - 2
+        b = #<BYTE>pDest[rPos] & 255
+        IF b = 13 THEN
+            ' Ignore CR
+        ELSEIF b = 10 THEN
+            #<BYTE>pTemp[wPos] = 10
+            wPos = wPos + 1
+            lineLen = 0
+            lastSpaceW = -1
+        ELSEIF b = 32 THEN
+            lastSpaceW = wPos
+            #<BYTE>pTemp[wPos] = 32
+            wPos = wPos + 1
+            lineLen = lineLen + 1
+        ELSE
+            #<BYTE>pTemp[wPos] = b
+            wPos = wPos + 1
+            lineLen = lineLen + 1
+            IF lineLen > maxWidth THEN
+                IF lastSpaceW <> -1 THEN
+                    #<BYTE>pTemp[lastSpaceW] = 10
+                    lineLen = wPos - lastSpaceW - 1
+                    lastSpaceW = -1
+                ELSE
+                    #<BYTE>pTemp[wPos] = #<BYTE>pTemp[wPos-1]
+                    #<BYTE>pTemp[wPos-1] = 10
+                    wPos = wPos + 1
+                    lineLen = 1
+                ENDIF
+            ENDIF
+        ENDIF
+        rPos = rPos + 1
+    ENDWHILE
+    #<BYTE>pTemp[wPos] = 0
+
+    rPos = 0
+    WHILE #<BYTE>pTemp[rPos] <> 0
+        #<BYTE>pDest[rPos] = #<BYTE>pTemp[rPos]
+        rPos = rPos + 1
+    ENDWHILE
+    #<BYTE>pDest[rPos] = 0
+    DELETE pTemp
+ENDSUB
+
+' ----------------------------------------------------------------------------
+' Graphical & UI Subroutines
+' ----------------------------------------------------------------------------
+SUB SetTheme()
+    SELECT g_Theme
+        CASE 0 ' Retro Default
+            colStatic = C_DARK_GRAY
+            colArtist = C_MAGENTA
+            colTitle  = C_WHITE
+            colAlbum  = C_YELLOW
+            colVol    = C_LIGHT_GRAY
+            colQueue  = C_RED
+            colStatusPlay = C_GREEN
+            colStatusPause= C_DARK_GREEN
+            colProg   = C_CYAN : colVU = C_GREEN : colTech = C_CYAN
+
+        CASE 1 ' Matrix Terminal
+            colStatic = C_DARK_GREEN
+            colArtist = C_GREEN
+            colTitle  = C_WHITE
+            colAlbum  = C_GREEN
+            colVol    = C_WHITE
+            colQueue  = C_GREEN
+            colStatusPlay = C_WHITE
+            colStatusPause= C_DARK_GREEN
+            colProg   = C_GREEN : colVU = C_GREEN : colTech = C_GREEN
+
+        CASE 2 ' Amber CRT
+            colStatic = C_DARK_YELLOW
+            colArtist = C_YELLOW
+            colTitle  = C_WHITE
+            colAlbum  = C_YELLOW
+            colVol    = C_WHITE
+            colQueue  = C_YELLOW
+            colStatusPlay = C_WHITE
+            colStatusPause= C_DARK_YELLOW
+            colProg   = C_YELLOW : colVU = C_YELLOW : colTech = C_YELLOW
+
+        CASE 3 ' Vaporwave Neon
+            colStatic = C_DARK_MAGENTA
+            colArtist = C_CYAN
+            colTitle  = C_WHITE
+            colAlbum  = C_MAGENTA
+            colVol    = C_CYAN
+            colQueue  = C_YELLOW
+            colStatusPlay = C_WHITE
+            colStatusPause= C_DARK_CYAN
+            colProg   = C_CYAN : colVU = C_YELLOW : colTech = C_MAGENTA
+
+        CASE 4 ' Cyberpunk Blue
+            colStatic = C_BLUE
+            colArtist = C_CYAN
+            colTitle  = C_WHITE
+            colAlbum  = C_CYAN
+            colVol    = C_WHITE
+            colQueue  = C_BLUE
+            colStatusPlay = C_CYAN
+            colStatusPause= C_DARK_CYAN
+            colProg   = C_BLUE : colVU = C_CYAN : colTech = C_WHITE
+
+        CASE 5 ' Blood Moon
+            colStatic = C_RED
+            colArtist = C_RED
+            colTitle  = C_WHITE
+            colAlbum  = C_RED
+            colVol    = C_YELLOW
+            colQueue  = C_RED
+            colStatusPlay = C_WHITE
+            colStatusPause= C_DARK_YELLOW
+            colProg   = C_RED : colVU = C_YELLOW : colTech = C_RED
+
+        CASE 6 ' Classic Monochrome
+            colStatic = C_DARK_GRAY
+            colArtist = C_LIGHT_GRAY
+            colTitle  = C_WHITE
+            colAlbum  = C_LIGHT_GRAY
+            colVol    = C_WHITE
+            colQueue  = C_LIGHT_GRAY
+            colStatusPlay = C_WHITE
+            colStatusPause= C_DARK_GRAY
+            colProg   = C_LIGHT_GRAY : colVU = C_WHITE : colTech = C_LIGHT_GRAY
+    ENDSELECT
+    DrawStaticHUD()
+ENDSUB
+
+SUB DrawCoverArt(DWORD hStream, STRING trackPath)
+    STRING dirPath, fileName, imgPath = ""
+    FILE hF
+    
+    IF SplitTwo(trackPath, "\\", dirPath, fileName, 0, 1) = 1 THEN
+        dirPath = dirPath + "\\"
+    ELSE
+        dirPath = ""
+    ENDIF
+    
+    STRING testPath = dirPath + "cover.jpg"
+    IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF
+    IF imgPath = "" THEN : testPath = dirPath + "cover.png"  : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
+    IF imgPath = "" THEN : testPath = dirPath + "folder.jpg" : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
+    IF imgPath = "" THEN : testPath = dirPath + "folder.png" : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
+    IF imgPath = "" THEN : testPath = dirPath + "front.jpg"  : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
+    IF imgPath = "" THEN : testPath = dirPath + "front.png"  : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
+    
+    IF imgPath = "" THEN
+        POINTER pID3 = BASS_ChannelGetTags(hStream, BASS_TAG_ID3V2)
+        IF pID3 <> 0 THEN
+            INT b1 = *<BYTE>(pID3 + 6) & 0x7F, b2 = *<BYTE>(pID3 + 7) & 0x7F
+            INT b3 = *<BYTE>(pID3 + 8) & 0x7F, b4 = *<BYTE>(pID3 + 9) & 0x7F
+            INT tagSize = (b1 << 21) | (b2 << 14) | (b3 << 7) | b4
+            INT i, imgSize = 0
+            STRING tmpImg = ""
+            
+            FOR i = 10 TO tagSize - 4
+                IF *<BYTE>(pID3 + i) = 0xFF AND *<BYTE>(pID3 + i + 1) = 0xD8 AND *<BYTE>(pID3 + i + 2) = 0xFF THEN
+                    imgSize = tagSize - i
+                    tmpImg = GETSTARTPATH() + "cplay_tmp.jpg"
+                ELSEIF *<BYTE>(pID3 + i) = 0x89 AND *<BYTE>(pID3 + i + 1) = 0x50 AND *<BYTE>(pID3 + i + 2) = 0x4E AND *<BYTE>(pID3 + i + 3) = 0x47 THEN
+                    imgSize = tagSize - i
+                    tmpImg = GETSTARTPATH() + "cplay_tmp.png"
+                ENDIF
+                
+                IF tmpImg <> "" THEN
+                    UINT hFile = CreateFileA(tmpImg, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0)
+                    IF hFile <> -1 AND hFile <> 0 THEN
+                        DWORD bytesWritten = 0
+                        WriteFile(hFile, pID3 + i, imgSize, &bytesWritten, 0)
+                        CloseHandle(hFile)
+                        imgPath = tmpImg
+                    ENDIF
+                    i = tagSize
+                ENDIF
+            NEXT i
+        ENDIF
+    ENDIF
+
+    IF imgPath = "" THEN
+        POINTER pPic = BASS_ChannelGetTags(hStream, BASS_TAG_FLAC_PICTURE)
+        IF pPic <> 0 THEN
+            DWORD flacImgSize = *<DWORD>(pPic + 28)
+            POINTER pData = *<POINTER>(pPic + 32)
+            
+            IF pData <> 0 AND flacImgSize > 0 THEN
+                STRING tmpFlacImg = ""
+                IF *<BYTE>(pData) = 0xFF AND *<BYTE>(pData + 1) = 0xD8 AND *<BYTE>(pData + 2) = 0xFF THEN
+                    tmpFlacImg = GETSTARTPATH() + "cplay_tmp.jpg"
+                ELSEIF *<BYTE>(pData) = 0x89 AND *<BYTE>(pData + 1) = 0x50 AND *<BYTE>(pData + 2) = 0x4E AND *<BYTE>(pData + 3) = 0x47 THEN
+                    tmpFlacImg = GETSTARTPATH() + "cplay_tmp.png"
+                ENDIF
+                
+                IF tmpFlacImg <> "" THEN
+                    UINT hFileFlac = CreateFileA(tmpFlacImg, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0)
+                    IF hFileFlac <> -1 AND hFileFlac <> 0 THEN
+                        DWORD bytesWrittenFlac = 0
+                        WriteFile(hFileFlac, pData, flacImgSize, &bytesWrittenFlac, 0)
+                        CloseHandle(hFileFlac)
+                        imgPath = tmpFlacImg
+                    ENDIF
+                ENDIF
+            ENDIF
+        ENDIF
+    ENDIF
+    
+    IF imgPath = "" THEN RETURN
+    
+    POINTER pWidePath = GetWideString(imgPath)
+    POINTER pImage = 0
+    GdipLoadImageFromFile(pWidePath, &pImage)
+    DELETE pWidePath
+    
+    IF pImage = 0 THEN RETURN 
+    
+    UINT hBmp = 0
+    GdipCreateHBITMAPFromBitmap(pImage, &hBmp, 0)
+    GdipDisposeImage(pImage) 
+    
+    IF hBmp = 0 THEN RETURN
+    
+    UINT hWnd = GetConsoleWindow()
+    UINT hDC = GetDC(hWnd)
+    UINT hMemDC = CreateCompatibleDC(hDC)
+    UINT hOldBmp = SelectObject(hMemDC, hBmp)
+    
+    WINRECT crect
+    GetClientRect(hWnd, &crect)
+    BITMAP bm
+    GetObjectA(hBmp, LEN(bm), &bm)
+    
+    INT targetW = 145, targetH = 145
+    INT posX = crect.left + 5, posY = crect.bottom - targetH - 23
+    
+    StretchBlt(hDC, posX, posY, targetW, targetH, hMemDC, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY)
+    
+    SelectObject(hMemDC, hOldBmp)
+    DeleteDC(hMemDC)
+    ReleaseDC(hWnd, hDC)
+    DeleteObject(hBmp)
+ENDSUB
+
+SUB DrawProgressBar(DOUBLE currentS, DOUBLE totalS, INT barWidth)
+    INT filled = 0, percentage = 0, i
+    STRING barStr = ""
+    IF totalS > 0 THEN
+        percentage = INT((currentS / totalS) * 100)
+        filled = INT((currentS / totalS) * barWidth)
+    ENDIF
+    IF percentage > 100 THEN percentage = 100
+    IF filled > barWidth THEN filled = barWidth
+
+    FOR i = 1 TO barWidth
+        IF i <= filled THEN barStr = barStr + CHR$(178) ELSE barStr = barStr + CHR$(176)
+    NEXT i
+    PRINT barStr + " " + RIGHT$("  " + STR$(percentage), 3) + "%  "
+ENDSUB
+
+SUB DrawVerticalMeter(INT lLevel, INT rLevel, INT startX, INT startY, INT meterHeight)
+    INT lFilled = INT((lLevel / 31000.0) * meterHeight)
+    INT rFilled = INT((rLevel / 31000.0) * meterHeight)
+    
+    IF lFilled > meterHeight THEN lFilled = meterHeight
+    IF rFilled > meterHeight THEN rFilled = meterHeight
+
+    INT row, idx, fillLevel
+    STRING lChar, rChar
+
+    FOR idx = 0 TO meterHeight - 1
+        row = startY + idx
+        fillLevel = meterHeight - idx
+
+        IF fillLevel >= 9 THEN
+            SetColor(C_RED)
+        ELSEIF fillLevel >= 7 THEN
+            SetColor(C_YELLOW)
+        ELSE
+            SetColor(C_GREEN)
+        ENDIF
+
+        IF lFilled >= fillLevel THEN lChar = CHR$(178) ELSE lChar = CHR$(176)
+        IF rFilled >= fillLevel THEN rChar = CHR$(178) ELSE rChar = CHR$(176)
+
+        ConsoleWrite(startX, row, lChar + lChar + " " + rChar + rChar)
+    NEXT idx
+    SetColor(colStatic)
+ENDSUB
+
+SUB DrawStaticHUD()
+    CLS
+    SetColor(colVol + (colStatic * 16))
+    SetConsolePos(1, 0) : PRINT "  [SPACE] Pause | [P]rev | [N]ext | [S]huffle | [Up/Dn] Vol | [Lft/Rgt] Seek  "
+    SetColor(colStatic)
+    SetConsolePos(1, 2) : PRINT " ARTIST   :"
+    SetConsolePos(1, 3) : PRINT " TITLE    :"
+    SetConsolePos(1, 4) : PRINT " ALBUM    :"
+    SetConsolePos(1, 5) : PRINT " YEAR     :"
+    SetConsolePos(34, 5): PRINT " TRACK : "
+    SetConsolePos(1, 6) : PRINT " QUEUE    :"
+    SetConsolePos(1, 7) : PRINT " STATUS   :"
+    SetConsolePos(1, 8) : PRINT " PROGRESS :"
+    SetConsolePos(1, 9) : PRINT " FORMAT   :"
+    SetConsolePos(1, 10): PRINT " BITRATE  :"
+    SetConsolePos(1, 11): PRINT " SIZE     :"
+
+    SetColor(colVol + (colStatic * 16))
+    SetConsolePos(19, 24) : PRINT "[T]hemes | [C]omments | [L]yrics | [O]ptions | [Q]uit" + SPACE$(7)
+    SetColor(colStatic)
+ENDSUB
+
+SUB DrawStatusLine(INT isPlaying, DOUBLE currentSecs, DOUBLE totalSecs, INT volLevel)
+    SetConsolePos(13, 7)
+    STRING volStr = "VOL: " + RIGHT$("  " + LTRIM$(STR$(volLevel)), 3) + "%"
+    STRING timeStr = FormatTimeStr(currentSecs) + " / " + FormatTimeStr(totalSecs)
+    
+    STRING statusTag
+    IF isPlaying = 1 THEN
+        statusTag = "[PLAYING]"
+        SetColor(colStatusPlay)
+    ELSE
+        statusTag = "[PAUSED] "
+        SetColor(colStatusPause)
+    ENDIF
+    
+    STRING leftSide = statusTag
+    INT spacesNeeded = 53 - LEN(leftSide) - LEN(timeStr) - LEN(volStr)
+    spacesNeeded = spacesNeeded/2
+    IF spacesNeeded < 1 THEN spacesNeeded = 1
+    
+    STRING fullRow = leftSide + SPACE$(spacesNeeded) + volStr + SPACE$(spacesNeeded) + timeStr
+    IF LEN(fullRow) < 53 THEN fullRow = fullRow + SPACE$(53 - LEN(fullRow))
+    IF LEN(fullRow) > 53 THEN fullRow = LEFT$(fullRow, 53)
+    
+    PRINT fullRow
+    SetColor(colStatic)
+ENDSUB
+
+SUB RedrawCurrentScreen()
+    SELECT g_InOptionsView
+        CASE 0 : RedrawPlayerView()
+        CASE 1 : DrawOptionsScreen()
+        CASE 2 : DrawMoreOptionsScreen()
+    ENDSELECT
+ENDSUB
+
+SUB DrawMoreOptionsScreen()
+    CLS
+
+    ' Top Banner
+    SetColor(C_WHITE + (C_DARK_BLUE * 16))
+    SetConsolePos(0, 0)
+    PRINT "--[ AUDIO ENGINE & ACCESSIBILITY OPTIONS ]" + STRING$(38, 196)
+
+    ' ------------------------------------------------------------------------
+    ' 1. ACCESSIBILITY & AUDIO BALANCE
+    ' ------------------------------------------------------------------------
+    SetConsolePos(2, 3)
+    SetColor(C_YELLOW)
+    PRINT "[ Hearing & Audio Balance ]"
+
+    ' Row 0: L/R Balance Slider
+    SetConsolePos(2, 5)
+    IF g_MoreFocus = 0 THEN SetColor(C_BLACK + (C_CYAN * 16)) ELSE SetColor(C_LIGHT_GRAY)
+    PRINT "  L/R Channel Balance  : "
+
+    STRING balStr = "CENTER (0)"
+    IF g_Balance < 0 THEN balStr = "L " + LTRIM$(STR$(ABS(g_Balance))) + "%"
+    IF g_Balance > 0 THEN balStr = "R " + LTRIM$(STR$(g_Balance)) + "%"
+
+    SetConsolePos(27, 5)
+    IF g_MoreFocus = 0 THEN SetColor(C_BLACK + (C_WHITE * 16)) ELSE SetColor(C_WHITE)
+    PRINT "< " + LEFT$(balStr + SPACE$(12), 12) + " >"
+
+    ' Row 1: Mono Downmix Toggle
+    SetConsolePos(2, 7)
+    IF g_MoreFocus = 1 THEN SetColor(C_BLACK + (C_CYAN * 16)) ELSE SetColor(C_LIGHT_GRAY)
+    PRINT "  Mono Downmix         : "
+
+    SetConsolePos(27, 7)
+    SELECT g_MonoDownmix
+        CASE 1 : SetColor(C_GREEN) : PRINT "[ON]  (Sum L+R to Both Ears)"
+        CASE 0 : SetColor(C_RED)   : PRINT "[OFF] (Standard Stereo)"
+    ENDSELECT
+
+    ' ------------------------------------------------------------------------
+    ' 2. PLAYBACK ENGINE SETTINGS
+    ' ------------------------------------------------------------------------
+    SetConsolePos(2, 10)
+    SetColor(C_YELLOW)
+    PRINT "[ Playback & Stream Engine ]"
+
+    ' Row 2: Active Audio Output Device
+    SetConsolePos(2, 12)
+    IF g_MoreFocus = 2 THEN SetColor(C_BLACK + (C_CYAN * 16)) ELSE SetColor(C_LIGHT_GRAY)
+    PRINT "  Audio Output Device  : "
+
+    STRING devNameStr = "Default System Device"
+    IF g_SelectedDevice >= 0 AND g_SelectedDevice < g_AudioDeviceCount THEN
+        devNameStr = g_AudioDeviceList[g_SelectedDevice]
+    ENDIF
+
+    SetConsolePos(27, 12)
+    IF g_MoreFocus = 2 THEN SetColor(C_BLACK + (C_WHITE * 16)) ELSE SetColor(C_CYAN)
+    PRINT "< " + LEFT$(devNameStr + SPACE$(48), 48) + " >"
+
+    ' Row 3: Gapless Pre-loading Toggle
+    SetConsolePos(2, 14)
+    IF g_MoreFocus = 3 THEN SetColor(C_BLACK + (C_CYAN * 16)) ELSE SetColor(C_LIGHT_GRAY)
+    PRINT "  Gapless Pre-loading  : "
+
+    SetConsolePos(27, 14)
+    SELECT g_Gapless
+        CASE 1 : SetColor(C_GREEN) : PRINT "[ON]  (Zero-delay Track Transitions)"
+        CASE 0 : SetColor(C_RED)   : PRINT "[OFF] (Standard Disk Load)"
+    ENDSELECT
+
+    ' Row 4: Crossfade Delay
+    SetConsolePos(2, 16)
+    IF g_MoreFocus = 4 THEN SetColor(C_BLACK + (C_CYAN * 16)) ELSE SetColor(C_LIGHT_GRAY)
+    PRINT "  Crossfade Delay      : "
+
+    SetConsolePos(27, 16)
+    IF g_Crossfade = 0 THEN
+        SetColor(C_LIGHT_GRAY) : PRINT "[OFF] (0.0 Seconds)"
+    ELSE
+        SetColor(C_CYAN) : PRINT "[" + LTRIM$(STR$(g_Crossfade)) + ".0 Seconds]"
+    ENDIF
+
+    ' Row 5: Startup Position Resume
+    SetConsolePos(2, 18)
+    IF g_MoreFocus = 5 THEN SetColor(C_BLACK + (C_CYAN * 16)) ELSE SetColor(C_LIGHT_GRAY)
+    PRINT "  Resume Track Position: "
+
+    SetConsolePos(27, 18)
+    SELECT g_ResumePos
+        CASE 1 : SetColor(C_GREEN) : PRINT "[ON]  (Remember Track & Time on Startup)"
+        CASE 0 : SetColor(C_RED)   : PRINT "[OFF] (Always Start Fresh)"
+    ENDSELECT
+
+    ' Footer Hotkeys
+    SetColor(C_WHITE + (C_DARK_BLUE * 16))
+    SetConsolePos(0, 24)
+    PRINT " [Up/Dn] Select | [Lft/Rgt] Adjust | [Space] Cycle/Toggle | [Esc] Back to EQ" + SPACE$(4)
+    SetColor(C_LIGHT_GRAY)
+ENDSUB
+
+SUB DrawEqNumericForm()
+    INT band, rowY
+    DOUBLE gVal
+    STRING freqLabels[10]
+    STRING labelStr, valStr, gStr
+
+    freqLabels[0] = "  31 Hz"
+    freqLabels[1] = "  62 Hz"
+    freqLabels[2] = " 125 Hz"
+    freqLabels[3] = " 250 Hz"
+    freqLabels[4] = " 500 Hz"
+    freqLabels[5] = "  1 kHz"
+    freqLabels[6] = "  2 kHz"
+    freqLabels[7] = "  4 kHz"
+    freqLabels[8] = "  8 kHz"
+    freqLabels[9] = " 16 kHz"
+
+    ' Form Header
+    SetConsolePos(EQ_FORM_X, EQ_FORM_Y - 1)
+    IF g_OptionsFocus = 2 THEN
+        SetColor(C_YELLOW)
+        PRINT "[ 10-Band EQ Parameters ]"
+    ELSE
+        SetColor(C_WHITE)
+        PRINT "  10-Band EQ Parameters "
+    ENDIF
+
+    FOR band = 0 TO 9
+        rowY = EQ_FORM_Y + band
+
+        ' 1. Print Band Label at Column EQ_FORM_X
+        SetConsolePos(EQ_FORM_X, rowY)
+        IF (band = g_SelectedEqBand AND g_OptionsFocus = 2) THEN
+            SetColor(C_BLACK + (C_CYAN * 16))
+            labelStr = "  Band " + RIGHT$(" " + LTRIM$(STR$(band + 1)), 2) + " [" + freqLabels[band] + "] : "
+        ELSE
+            SetColor(C_LIGHT_GRAY)
+            labelStr = "  Band " + RIGHT$(" " + LTRIM$(STR$(band + 1)), 2) + " [" + freqLabels[band] + "] : "
+        ENDIF
+        PRINT labelStr
+
+        ' 2. Print dB Value Box at Explicit Column (EQ_FORM_X + 22)
+        SetConsolePos(EQ_FORM_X + 22, rowY)
+        gVal = g_EqGains[band]
+
+        ' Format decimal string representation
+        gStr = LTRIM$(STR$(gVal))
+        IF INSTR(gStr, ".") = 0 THEN gStr = gStr + ".0"
+
+        IF gVal > 0.0 THEN
+            valStr = "+" + gStr + " dB"
+            IF (band = g_SelectedEqBand AND g_OptionsFocus = 2) THEN
+                SetColor(C_BLACK + (C_GREEN * 16))
+            ELSE
+                SetColor(C_GREEN)
+            ENDIF
+        ELSEIF gVal < 0.0 THEN
+            valStr = gStr + " dB"
+            IF (band = g_SelectedEqBand AND g_OptionsFocus = 2) THEN
+                SetColor(C_BLACK + (C_RED * 16))
+            ELSE
+                SetColor(C_RED)
+            ENDIF
+        ELSE
+            valStr = " 0.0 dB"
+            IF (band = g_SelectedEqBand AND g_OptionsFocus = 2) THEN
+                SetColor(C_BLACK + (C_WHITE * 16))
+            ELSE
+                SetColor(C_WHITE)
+            ENDIF
+        ENDIF
+
+        PRINT LEFT$(valStr + SPACE$(10), 10)
+    NEXT band
+
+    ' Precut Status Line
+    SetConsolePos(EQ_FORM_X, EQ_FORM_Y + 11)
+    SetColor(C_DARK_GRAY)
+    
+    gStr = LTRIM$(STR$(g_EqPrecut))
+    IF INSTR(gStr, ".") = 0 THEN gStr = gStr + ".0"
+    PRINT "Safety Precut Headroom: " + gStr + " dB"
+    SetColor(C_LIGHT_GRAY)
+ENDSUB
+
+SUB DrawEqResponseGraph()
+    UINT hWnd = GetConsoleWindow()
+    IF hWnd = 0 THEN RETURN
+    
+    UINT hDC = GetDC(hWnd)
+    IF hDC = 0 THEN RETURN
+
+    WINRECT crect
+    GetClientRect(hWnd, &crect)
+
+    ' Shifted left: matching Columns 40-77, Rows 2-7
+    INT posX   = INT(crect.right * (40.0 / 80.0))
+    INT posY   = INT(crect.bottom * (2.0 / 27.0))
+    INT graphW = INT(crect.right * (37.0 / 80.0)) - 6
+    INT graphH = INT(crect.bottom * (5.5 / 27.0))
+
+    IF graphW < 100 OR graphH < 40 THEN
+        ReleaseDC(hWnd, hDC)
+        RETURN
+    ENDIF
+
+    ' Create Off-Screen Memory DC & Compatible Bitmap
+    UINT hMemDC  = CreateCompatibleDC(hDC)
+    UINT hBmp    = CreateCompatibleBitmap(hDC, graphW, graphH)
+    UINT hOldBmp = SelectObject(hMemDC, hBmp)
+
+    ' ========================================================================
+    ' 1. BLACK BACKGROUND
+    ' ========================================================================
+    UINT hBlackBrush = CreateSolidBrush(RGB(0, 0, 0))
+    WINRECT boxRect
+    boxRect.left = 0 : boxRect.top = 0 : boxRect.right = graphW : boxRect.bottom = graphH
+    FillRect(hMemDC, &boxRect, hBlackBrush)
+    DeleteObject(hBlackBrush)
+
+    ' ========================================================================
+    ' 2. FONT CREATION: SMALL FONTS (-9 px bitmap size)
+    ' ========================================================================
+    UINT hGraphFont = CreateFontA(-9, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, "Small Fonts")
+    UINT hOldFont   = SelectObject(hMemDC, hGraphFont)
+
+    SetBkMode(hMemDC, 1) ' TRANSPARENT background
+    SetTextColor(hMemDC, RGB(255, 255, 0)) ' Yellow Axis Text
+
+    ' ========================================================================
+    ' 3. YELLOW AXES & LABELS (RGB 255, 255, 0)
+    ' ========================================================================
+    UINT hYellowPen = CreatePen(0, 1, RGB(255, 255, 0))
+    UINT hOldPen    = SelectObject(hMemDC, hYellowPen)
+
+    INT axisLeft  = 24
+    INT axisRight = graphW - 8
+    INT axisMidY  = INT(graphH / 2)
+    INT axisTopY  = 6
+    INT axisBotY  = graphH - 12
+
+    ' Center 0 dB Reference Line
+    MoveToEx(hMemDC, axisLeft, axisMidY, 0)
+    API_LineTo(hMemDC, axisRight, axisMidY)
+
+    ' Left Y-Axis Baseline
+    MoveToEx(hMemDC, axisLeft, axisTopY, 0)
+    API_LineTo(hMemDC, axisLeft, axisBotY)
+
+    ' Render Axis Text Labels
+    TextOutA(hMemDC, 1, axisTopY - 3, "+12", 3)
+    TextOutA(hMemDC, 8, axisMidY - 4, "0", 1)
+    TextOutA(hMemDC, 2, axisBotY - 4, "-12", 3)
+
+    ' Frequency Labels at Base
+    TextOutA(hMemDC, axisLeft, axisBotY + 1, "31", 2)
+    TextOutA(hMemDC, INT((axisLeft + axisRight) / 2) - 6, axisBotY + 1, "1k", 2)
+    TextOutA(hMemDC, axisRight - 14, axisBotY + 1, "16k", 3)
+
+    ' ========================================================================
+    ' 4. POINT CALCULATION FOR 10 EQ BANDS
+    ' ========================================================================
+    POINT curvePts[10]
+    INT i
+    DOUBLE xStep  = (axisRight - axisLeft) / 9.0
+    DOUBLE yRange = (axisMidY - axisTopY)
+
+    FOR i = 0 TO 9
+        curvePts[i].x = axisLeft + INT(i * xStep)
+        
+        DOUBLE g = g_EqGains[i]
+        IF g > 12.0  THEN g = 12.0
+        IF g < -12.0 THEN g = -12.0
+        
+        curvePts[i].y = axisMidY - INT((g / 12.0) * yRange)
+    NEXT i
+
+    ' ========================================================================
+    ' 5. CYAN RESPONSE CURVE (RGB 0, 255, 255)
+    ' ========================================================================
+    UINT hCyanPen = CreatePen(0, 2, RGB(0, 255, 255))
+    SelectObject(hMemDC, hCyanPen)
+
+    Polyline(hMemDC, &curvePts[0], 10)
+
+    ' ========================================================================
+    ' 6. BLIT TO CONSOLE & RESOURCE CLEANUP
+    ' ========================================================================
+    BitBlt(hDC, posX, posY, graphW, graphH, hMemDC, 0, 0, SRCCOPY)
+
+    ' Cleanup
+    SelectObject(hMemDC, hOldPen)
+    DeleteObject(hYellowPen)
+    DeleteObject(hCyanPen)
+
+    SelectObject(hMemDC, hOldFont)
+    DeleteObject(hGraphFont)
+
+    SelectObject(hMemDC, hOldBmp)
+    DeleteObject(hBmp)
+    DeleteDC(hMemDC)
+    ReleaseDC(hWnd, hDC)
+ENDSUB
+
+' ----------------------------------------------------------------------------
+' Queue & Parser Helpers
+' ----------------------------------------------------------------------------
+SUB AddToQueue(STRING filePath)
+    filePath = LTRIM$(RTRIM$(filePath))
+    IF g_TrackCount < MAX_PLAYLIST AND LEN(filePath) > 0 THEN
+        g_Playlist[g_TrackCount] = filePath
+        g_TrackCount = g_TrackCount + 1
+    ENDIF
+ENDSUB
+
+SUB LoadExternalLRC(STRING trackPath, POINTER pDest, INT maxLen)
+    STRING lrcPath
+    INT i, dotPos = -1
+    
+    FOR i = LEN(trackPath) TO 1 STEP -1
+        IF MID$(trackPath, i, 1) = "." AND dotPos = -1 THEN dotPos = i
+        IF MID$(trackPath, i, 1) = "\\" OR MID$(trackPath, i, 1) = "/" THEN BREAK
+    NEXT i
+    
+    IF dotPos > 0 THEN
+        lrcPath = LEFT$(trackPath, dotPos - 1) + ".lrc"
+    ELSE
+        lrcPath = trackPath + ".lrc"
+    ENDIF
+    
+    FILE hF
+    STRING lineStr
+    INT outIdx = 0, k, lineLen
+    
+    IF OPENFILE(hF, lrcPath, "R") = 0 THEN
+        WHILE READ(hF, lineStr) = 0 AND outIdx < maxLen - 256
+            lineLen = LEN(lineStr)
+            FOR k = 1 TO lineLen
+                #<BYTE>pDest[outIdx] = ASC(MID$(lineStr, k, 1))
+                outIdx = outIdx + 1
+            NEXT k
+            #<BYTE>pDest[outIdx] = 10
+            outIdx = outIdx + 1
+        ENDWHILE
+        #<BYTE>pDest[outIdx] = 0
+        CLOSEFILE(hF)
+    ENDIF
+ENDSUB
+
+SUB ParseLRC(POINTER pContent)
+    g_SyncedCount = 0
+    g_IsSyncedLyrics = 0
+    IF #<BYTE>pContent[0] = 0 THEN RETURN
+
+    INT cPos = 0, lineLen = 0, b
+    ISTRING lineBuf[128]
+    DOUBLE mins, secs, ts
+    INT bracketEnd, colonPos
+
+    WHILE #<BYTE>pContent[cPos] <> 0 AND g_SyncedCount < 300
+        b = #<BYTE>pContent[cPos] & 255
+        IF b = 13 THEN
+            ' Ignore CR
+        ELSEIF b = 10 THEN
+            lineBuf[lineLen] = 0
+            IF lineBuf[0] = 91 THEN
+                colonPos = INSTR(lineBuf, ":")
+                bracketEnd = INSTR(lineBuf, "]")
+                IF colonPos > 1 AND bracketEnd > colonPos THEN
+                    mins = VAL(MID$(lineBuf, 2, colonPos - 2))
+                    secs = VAL(MID$(lineBuf, colonPos + 1, bracketEnd - colonPos - 1))
+                    ts = mins * 60.0 + secs
+                    
+                    g_SyncedLyrics[g_SyncedCount].timestamp = ts
+                    g_SyncedLyrics[g_SyncedCount].text = LTRIM$(RTRIM$(RIGHT$(lineBuf, LEN(lineBuf) - bracketEnd)))
+                    g_SyncedCount = g_SyncedCount + 1
+                    g_IsSyncedLyrics = 1
+                ENDIF
+            ENDIF
+            lineLen = 0
+        ELSE
+            IF lineLen < 127 THEN
+                lineBuf[lineLen] = b
+                lineLen = lineLen + 1
+            ENDIF
+        ENDIF
+        cPos = cPos + 1
+    ENDWHILE
+ENDSUB
+
+SUB ParseM3U(STRING playlistPath)
+    FILE hFile
+    STRING lineBuffer, basePath = ""
+    INT i
+
+    FOR i = LEN(playlistPath) TO 1 STEP -1
+        IF MID$(playlistPath, i, 1) = "\\" OR MID$(playlistPath, i, 1) = "/" THEN
+            basePath = LEFT$(playlistPath, i) : BREAK
+        ENDIF
+    NEXT i
+
+    IF OPENFILE(hFile, playlistPath, "R") = 0 THEN
+        WHILE READ(hFile, lineBuffer) = 0
+            lineBuffer = LTRIM$(RTRIM$(lineBuffer))
+            IF LEN(lineBuffer) > 0 AND LEFT$(lineBuffer, 1) <> "#" THEN
+                IF MID$(lineBuffer, 2, 1) = ":" OR LEFT$(lineBuffer, 1) = "\\" OR LEFT$(lineBuffer, 1) = "/" THEN
+                    AddToQueue(lineBuffer)
+                ELSE
+                    AddToQueue(basePath + lineBuffer)
+                ENDIF
+            ENDIF
+        ENDWHILE
+        CLOSEFILE(hFile)
+    ENDIF
+ENDSUB
+
+SUB ProcessArgument(STRING param)
+    STRING folderPath, ext, trackPath
+    INT lastSlash = 0, idx, totalFiles, fileIdx, attr
+
+    ' Strip outer double quotes and surrounding whitespace
+    param = LTRIM$(RTRIM$(param))
+    WHILE LEFT$(param, 1) = CHR$(34) : param = RIGHT$(param, LEN(param) - 1) : WEND
+    WHILE RIGHT$(param, 1) = CHR$(34) : param = LEFT$(param, LEN(param) - 1) : WEND
+    param = LTRIM$(RTRIM$(param))
+    IF LEN(param) = 0 THEN RETURN
+
+    attr = GetFileAttributesA(param)
+    IF attr <> -1 AND (attr & 0x10) <> 0 THEN
+        folderPath = param
+        WHILE RIGHT$(folderPath, 1) = "\\" OR RIGHT$(folderPath, 1) = "/"
+            folderPath = LEFT$(folderPath, LEN(folderPath) - 1)
+        WEND
+
+        DynaNew(g_fileList, 100, 50)
+        totalFiles = GetDynaFileList(g_fileList, folderPath, "mp3", 1)
+        FOR fileIdx = 0 TO totalFiles - 1
+            DynaGetStr(g_fileList, fileIdx, trackPath)
+            AddToQueue(trackPath)
+        NEXT fileIdx
+        
+        totalFiles = GetDynaFileList(g_fileList, folderPath, "flac", 1)
+        FOR fileIdx = 0 TO totalFiles - 1
+            DynaGetStr(g_fileList, fileIdx, trackPath)
+            AddToQueue(trackPath)
+        NEXT fileIdx
+        DynaDelete(g_fileList)
+        RETURN
+    ENDIF
+
+    IF INSTR(param, "*") > 0 OR INSTR(param, "?") > 0 THEN
+        FOR idx = 1 TO LEN(param)
+            IF MID$(param, idx, 1) = "\\" OR MID$(param, idx, 1) = "/" THEN lastSlash = idx
+        NEXT idx
+
+        IF lastSlash > 0 THEN
+            folderPath = LEFT$(param, lastSlash - 1)
+            ext = RIGHT$(param, LEN(param) - lastSlash)
+        ELSE
+            folderPath = "." : ext = param
+        ENDIF
+
+        WHILE LEFT$(ext, 1) = "*" OR LEFT$(ext, 1) = "."
+            ext = RIGHT$(ext, LEN(ext) - 1)
+        WEND
+
+        DynaNew(g_fileList, 100, 50)
+        totalFiles = GetDynaFileList(g_fileList, folderPath, ext, 1)
+        FOR fileIdx = 0 TO totalFiles - 1
+            DynaGetStr(g_fileList, fileIdx, trackPath)
+            AddToQueue(trackPath)
+        NEXT fileIdx
+        DynaDelete(g_fileList)
+        RETURN
+    ENDIF
+
+    ext = LCASE$(RIGHT$(param, 4))
+    IF ext = ".m3u" THEN 
+        ParseM3U(param) 
+    ELSE 
+        AddToQueue(param)
+    ENDIF
+ENDSUB
+
+SUB EnumerateAudioDevices()
+    INT devIdx = 1  ' BASS device 0 is No Sound; 1+ are physical devices
+    POINTER pDevName = 0
+    g_AudioDeviceCount = 0
+
+    ' Slot 0 is reserved for Default System Output
+    g_AudioDeviceList[0] = "Default System Device"
+    g_AudioDeviceIDs[0]  = -1
+    g_AudioDeviceCount   = 1
+
+    pDevName = BASS_GetDeviceDescription(devIdx)
+    WHILE pDevName <> 0 AND g_AudioDeviceCount < 16
+        STRING dName = #<STRING>pDevName
+        IF LEN(dName) > 0 THEN
+            g_AudioDeviceList[g_AudioDeviceCount] = ConvertANSItoOEM(EnsureANSI(dName))
+            g_AudioDeviceIDs[g_AudioDeviceCount]  = devIdx
+            g_AudioDeviceCount = g_AudioDeviceCount + 1
+        ENDIF
+        devIdx = devIdx + 1
+        pDevName = BASS_GetDeviceDescription(devIdx)
+    ENDWHILE
+ENDSUB
+
+SUB InitAudioEngine(), INT
+    INT initResult = 0
+    INT targetDevice = -1
+
+    ' Resolve device ID mapping
+    IF g_SelectedDevice >= 0 AND g_SelectedDevice < g_AudioDeviceCount THEN
+        targetDevice = g_AudioDeviceIDs[g_SelectedDevice]
+    ENDIF
+
+    BASS_SetConfig(BASS_CONFIG_UPDATEPERIOD, 50)
+    BASS_SetConfig(BASS_CONFIG_BUFFER, 1000)
+    BASS_SetConfig(BASS_CONFIG_DEV_BUFFER, 50)
+
+    ' Initialize target output device (fallback to default -1 if targeted initialization fails)
+    initResult = BASS_Init(targetDevice, 44100, BASS_DEVICE_DMIX, 0, 0)
+    IF initResult = 0 AND targetDevice <> -1 THEN
+        Trace("InitAudioEngine: Specific device init failed. Falling back to default device.")
+        initResult = BASS_Init(-1, 44100, BASS_DEVICE_DMIX, 0, 0)
+    ENDIF
+
+    IF initResult = 0 THEN initResult = BASS_Init(-1, 44100, 0, 0, 0)
+    RETURN initResult
+ENDSUB
+
+SUB SwitchAudioOutputDevice(INT newDeviceListIdx)
+    IF newDeviceListIdx < 0 OR newDeviceListIdx >= g_AudioDeviceCount THEN RETURN
+
+    INT newDevID = g_AudioDeviceIDs[newDeviceListIdx]
+    g_SelectedDevice = newDeviceListIdx
+
+    ' Initialize target output hardware in BASS 2.2 if needed
+    IF newDevID <> -1 THEN
+        BASS_Init(newDevID, 44100, BASS_DEVICE_DMIX, 0, 0)
+        BASS_SetDevice(newDevID)
+    ELSE
+        BASS_Init(-1, 44100, BASS_DEVICE_DMIX, 0, 0)
+        BASS_SetDevice(-1)
+    ENDIF
+
+    ' Re-route active audio stream to new hardware output
+    IF hStream <> 0 THEN
+        QWORD curPos = BASS_ChannelGetPosition(hStream)
+        INT isPlay   = BASS_ChannelIsActive(hStream)
+
+        BASS_ChannelStop(hStream)
+        BASS_StreamFree(hStream)
+
+        hStream = CreateTrackStream(g_Playlist[argIdx])
+        ApplyAllDSP(hStream)
+        BASS_ChannelSetPosition(hStream, curPos)
+
+        IF isPlay = BASS_ACTIVE_PLAYING THEN
+            BASS_ChannelPlay(hStream, 0)
+        ENDIF
+    ENDIF
+
+    SaveConfig()
+ENDSUB
+
+SUB LoadConfig()
+    FILE hF
+    STRING iniPath = GETSTARTPATH() + "cplay.ini"
+    STRING lineStr, keyStr, valStr
+    INT eqPos, valNum
+
+    IF OPENFILE(hF, iniPath, "R") = 0 THEN
+        WHILE READ(hF, lineStr) = 0
+            lineStr = LTRIM$(RTRIM$(lineStr))
+            eqPos = INSTR(lineStr, "=")
+            IF eqPos > 0 THEN
+                keyStr = LCASE$(LTRIM$(RTRIM$(LEFT$(lineStr, eqPos - 1))))
+                valStr = LTRIM$(RTRIM$(RIGHT$(lineStr, LEN(lineStr) - eqPos)))
+                valNum = VAL(valStr)
+
+                SELECT keyStr
+                    CASE "volume"
+                        IF valNum >= 0 AND valNum <= 100 THEN g_Volume = valNum
+                    CASE "shuffle"
+                        IF valNum = 0 OR valNum = 1 THEN g_Shuffle = valNum
+                    CASE "theme"
+                        IF valNum >= 0 AND valNum <= 6 THEN g_Theme = valNum
+                    CASE "view"
+                        IF valNum >= 0 AND valNum <= 2 THEN g_ExtDisplay = valNum
+                    CASE "eq_enabled"
+                        IF valNum = 0 OR valNum = 1 THEN g_EqEnabled = valNum
+                    CASE "eq_profile"
+                        IF valStr <> "" THEN g_EqProfile = valStr
+                    CASE "norm_enabled"
+                        IF valNum = 0 OR valNum = 1 THEN g_NormEnabled = valNum
+                    CASE "comp_enabled"
+                        IF valNum = 0 OR valNum = 1 THEN g_CompEnabled = valNum
+                    CASE "reverb_enabled"
+                        IF valNum = 0 OR valNum = 1 THEN g_ReverbEnabled = valNum
+                    CASE "tube_enabled"
+                        IF valNum = 0 OR valNum = 1 THEN g_TubeEnabled = valNum
+                    CASE "widener_enabled"
+                        IF valNum = 0 OR valNum = 1 THEN g_WidenerEnabled = valNum
+                    CASE "balance"
+                        g_Balance = valNum
+                    CASE "mono_downmix"
+                        IF valNum = 0 OR valNum = 1 THEN g_MonoDownmix = valNum
+                    CASE "gapless"
+                        IF valNum = 0 OR valNum = 1 THEN g_Gapless = valNum
+                    CASE "crossfade"
+                        IF valNum >= 0 AND valNum <= 5 THEN g_Crossfade = valNum
+                    CASE "resume_pos"
+                        IF valNum = 0 OR valNum = 1 THEN g_ResumePos = valNum
+                    CASE "last_track_idx"
+                        IF valNum >= 0 THEN g_LastTrackIdx = valNum
+                    CASE "last_track_pos"
+                        g_LastTrackPos = VAL(valStr)
+                    CASE "device_idx"
+                        IF valNum >= 0 AND valNum < 16 THEN g_SelectedDevice = valNum
+                ENDSELECT
+            ENDIF
+        ENDWHILE
+        CLOSEFILE(hF)
+    ELSE
+        SaveConfig()
+    ENDIF
+ENDSUB
+
+SUB SaveConfig()
+    FILE hF
+    STRING iniPath = GETSTARTPATH() + "cplay.ini"
+
+    IF OPENFILE(hF, iniPath, "W") = 0 THEN
+        WRITE hF, "volume=" + LTRIM$(STR$(g_Volume))
+        WRITE hF, "shuffle=" + LTRIM$(STR$(g_Shuffle))
+        WRITE hF, "theme=" + LTRIM$(STR$(g_Theme))
+        WRITE hF, "view=" + LTRIM$(STR$(g_ExtDisplay))
+        WRITE hF, "eq_enabled=" + LTRIM$(STR$(g_EqEnabled))
+        WRITE hF, "eq_profile=" + g_EqProfile
+        WRITE hF, "norm_enabled=" + LTRIM$(STR$(g_NormEnabled))
+        WRITE hF, "comp_enabled=" + LTRIM$(STR$(g_CompEnabled))
+        WRITE hF, "reverb_enabled=" + LTRIM$(STR$(g_ReverbEnabled))
+        WRITE hF, "tube_enabled=" + LTRIM$(STR$(g_TubeEnabled))
+        WRITE hF, "widener_enabled=" + LTRIM$(STR$(g_WidenerEnabled))
+        WRITE hF, "balance=" + LTRIM$(STR$(g_Balance))
+        WRITE hF, "mono_downmix=" + LTRIM$(STR$(g_MonoDownmix))
+        WRITE hF, "gapless=" + LTRIM$(STR$(g_Gapless))
+        WRITE hF, "crossfade=" + LTRIM$(STR$(g_Crossfade))
+        WRITE hF, "resume_pos=" + LTRIM$(STR$(g_ResumePos))
+        WRITE hF, "last_track_idx=" + LTRIM$(STR$(g_LastTrackIdx))
+        WRITE hF, "last_track_pos=" + LTRIM$(STR$(g_LastTrackPos))
+        WRITE hF, "device_idx=" + LTRIM$(STR$(g_SelectedDevice))
+        CLOSEFILE(hF)
+    ENDIF
+ENDSUB
+
+SUB SavePlaylistM3U()
+    FILE hF
+    STRING m3uPath = GETSTARTPATH() + "cplay.m3u"
+    INT i
+
+    IF g_TrackCount <= 0 THEN RETURN
+
+    IF OPENFILE(hF, m3uPath, "W") = 0 THEN
+        FOR i = 0 TO g_TrackCount - 1
+            IF LEN(g_Playlist[i]) > 0 THEN
+                WRITE hF, g_Playlist[i]
+            ENDIF
+        NEXT i
+        CLOSEFILE(hF)
+    ENDIF
+ENDSUB
+
+' ----------------------------------------------------------------------------
+' Native Memory Tag Extractors
+' ----------------------------------------------------------------------------
+SUB GetVorbisComment(DWORD hStream, STRING targetField), STRING
+    POINTER pTags = BASS_ChannelGetTags(hStream, 2) 
+    IF pTags = 0 THEN RETURN ""
+
+    STRING currentStr = "", fieldPrefix = targetField + "=", result = ""
+    INT i = 0, pLen = LEN(fieldPrefix), charVal
+
+    WHILE 1
+        charVal = #<BYTE>pTags[i] & 255
+        IF charVal = 0 THEN
+            IF currentStr = "" THEN BREAK 
+            IF UCASE$(LEFT$(currentStr, pLen)) = fieldPrefix THEN
+                result = RIGHT$(currentStr, LEN(currentStr) - pLen)
+                BREAK
+            ENDIF
+            currentStr = ""
+        ELSE
+            currentStr = currentStr + CHR$(charVal)
+        ENDIF
+        i = i + 1
+    ENDWHILE
+    RETURN LTRIM$(RTRIM$(result))
+ENDSUB
+
+SUB GetRawID3v2(DWORD hStream, STRING targetID), STRING
+    POINTER pID3 = BASS_ChannelGetTags(hStream, BASS_TAG_ID3V2)
+    IF pID3 = 0 THEN RETURN ""
+
+    INT version = #<BYTE>pID3[3]
+    INT b1 = #<BYTE>pID3[6] & 0x7F, b2 = #<BYTE>pID3[7] & 0x7F
+    INT b3 = #<BYTE>pID3[8] & 0x7F, b4 = #<BYTE>pID3[9] & 0x7F
+    INT tagSize = (b1 << 21) | (b2 << 14) | (b3 << 7) | b4
+    INT pos = 10, fSize, headSize, k, charVal
+    STRING frameID, result, matchID
+
+    WHILE pos < tagSize - 10
+        charVal = #<BYTE>pID3[pos] & 255
+        IF charVal = 0 THEN BREAK 
+
+        IF version >= 3 THEN
+            frameID = CHR$(charVal) + CHR$(#<BYTE>pID3[pos+1] & 255) + CHR$(#<BYTE>pID3[pos+2] & 255) + CHR$(#<BYTE>pID3[pos+3] & 255)
+            fSize = ((#<BYTE>pID3[pos+4] & 255) << 24) | ((#<BYTE>pID3[pos+5] & 255) << 16) | ((#<BYTE>pID3[pos+6] & 255) << 8) | (#<BYTE>pID3[pos+7] & 255)
+            headSize = 10
+        ELSE
+            frameID = CHR$(charVal) + CHR$(#<BYTE>pID3[pos+1] & 255) + CHR$(#<BYTE>pID3[pos+2] & 255)
+            fSize = ((#<BYTE>pID3[pos+3] & 255) << 16) | ((#<BYTE>pID3[pos+4] & 255) << 8) | (#<BYTE>pID3[pos+5] & 255)
+            headSize = 6
+        ENDIF
+
+        IF fSize <= 0 OR (pos + headSize + fSize) > tagSize THEN BREAK
+
+        matchID = targetID
+        IF version = 2 AND LEN(targetID) = 4 THEN
+            IF targetID = "TIT2" THEN matchID = "TT2"
+            IF targetID = "TPE1" THEN matchID = "TP1"
+            IF targetID = "TALB" THEN matchID = "TAL"
+        ENDIF
+
+        IF frameID = matchID THEN
+            result = ""
+            FOR k = pos + headSize + 1 TO pos + headSize + fSize - 1
+                charVal = #<BYTE>pID3[k] & 255
+                IF charVal >= 32 AND charVal < 254 THEN result = result + CHR$(charVal)
+            NEXT k
+            RETURN LTRIM$(RTRIM$(result))
+        ENDIF
+        pos = pos + headSize + fSize
+    ENDWHILE
+    RETURN ""
+ENDSUB
+
+SUB GetRawID3v1(STRING trackPath, STRING targetID), STRING
+    UINT hFile = CreateFileA(trackPath, GENERIC_READ, 1, 0, OPEN_EXISTING, 0, 0)
+    IF hFile = -1 OR hFile = 0 THEN RETURN ""
+    
+    DWORD highSize = 0, lowSize = GetFileSize(hFile, &highSize)
+    IF lowSize < 128 THEN
+        CloseHandle(hFile) : RETURN ""
+    ENDIF
+
+    SetFilePointer(hFile, -128, 0, FILE_END)
+    POINTER pBuf = NEW(CHAR, 128)
+    DWORD bytesRead = 0
+    ReadFile(hFile, pBuf, 128, &bytesRead, 0)
+    CloseHandle(hFile)
+
+    IF bytesRead <> 128 THEN
+        DELETE pBuf : RETURN ""
+    ENDIF
+
+    IF #<BYTE>pBuf[0] <> 84 OR #<BYTE>pBuf[1] <> 65 OR #<BYTE>pBuf[2] <> 71 THEN
+        DELETE pBuf : RETURN ""
+    ENDIF
+
+    INT startIdx = 0, endIdx = 0
+    IF targetID = "TITLE" THEN
+        startIdx = 3 : endIdx = 32
+    ELSEIF targetID = "ARTIST" THEN
+        startIdx = 33 : endIdx = 62
+    ELSEIF targetID = "ALBUM" THEN
+        startIdx = 63 : endIdx = 92
+    ELSEIF targetID = "YEAR" THEN
+        startIdx = 93 : endIdx = 96
+    ENDIF
+
+    STRING result = ""
+    INT i, b
+    IF startIdx > 0 THEN
+        FOR i = startIdx TO endIdx
+            b = #<BYTE>pBuf[i] & 255
+            IF b = 0 THEN 
+                i = endIdx + 1
+            ELSE
+                result = result + CHR$(b)
+            ENDIF
+        NEXT i
+    ENDIF
+
+    DELETE pBuf
+    RETURN LTRIM$(RTRIM$(result))
+ENDSUB
+
+' ----------------------------------------------------------------------------
+' Native Memory Tag Extractors (Long Pointers >255 Chars)
+' ----------------------------------------------------------------------------
+SUB GetVorbisCommentLongPtr(DWORD hStream, STRING targetField, POINTER pDest, INT maxLen)
+    POINTER pTags = BASS_ChannelGetTags(hStream, 2) 
+    IF pTags = 0 THEN RETURN
+
+    STRING fieldPrefix = targetField + "="
+    INT pLen = LEN(fieldPrefix), i = 0, match, outIdx = 0, k, b
+    
+    WHILE 1
+        b = #<BYTE>pTags[i] & 255
+        IF b = 0 THEN BREAK
+        match = 1
+        FOR k = 0 TO pLen - 1
+            IF (#<BYTE>pTags[i + k] & 255) <> ASC(MID$(fieldPrefix, k + 1, 1)) THEN
+                match = 0 : BREAK
+            ENDIF
+        NEXT k
+        
+        IF match = 1 THEN
+            i = i + pLen
+            WHILE (#<BYTE>pTags[i] & 255) <> 0 AND outIdx < maxLen - 1
+                #<BYTE>pDest[outIdx] = #<BYTE>pTags[i]
+                outIdx = outIdx + 1 : i = i + 1
+            ENDWHILE
+            #<BYTE>pDest[outIdx] = 0
+            RETURN
+        ENDIF
+        
+        WHILE (#<BYTE>pTags[i] & 255) <> 0 : i = i + 1 : ENDWHILE
+        i = i + 1
+    ENDWHILE
+ENDSUB
+
+SUB GetID3v2LongTextPtr(DWORD hStream, STRING targetID, POINTER pDest, INT maxLen)
+    POINTER pID3 = BASS_ChannelGetTags(hStream, BASS_TAG_ID3V2)
+    IF pID3 = 0 THEN RETURN
+
+    INT version = #<BYTE>pID3[3]
+    INT tagSize = ((#<BYTE>pID3[6] & 0x7F) << 21) | ((#<BYTE>pID3[7] & 0x7F) << 14) | ((#<BYTE>pID3[8] & 0x7F) << 7) | (#<BYTE>pID3[9] & 0x7F)
+    INT pos = 10, fSize, headSize, k, enc, descEnd, textStart, charVal, outIdx
+    STRING frameID, matchID
+    
+    WHILE pos < tagSize - 10
+        charVal = #<BYTE>pID3[pos] & 255
+        IF charVal = 0 THEN BREAK
+
+        IF version >= 3 THEN
+            frameID = CHR$(charVal) + CHR$(#<BYTE>pID3[pos+1] & 255) + CHR$(#<BYTE>pID3[pos+2] & 255) + CHR$(#<BYTE>pID3[pos+3] & 255)
+            IF version = 4 THEN
+                fSize = ((#<BYTE>pID3[pos+4] & 0x7F) << 21) | ((#<BYTE>pID3[pos+5] & 0x7F) << 14) | ((#<BYTE>pID3[pos+6] & 0x7F) << 7) | (#<BYTE>pID3[pos+7] & 0x7F)
+            ELSE
+                fSize = ((#<BYTE>pID3[pos+4] & 255) << 24) | ((#<BYTE>pID3[pos+5] & 255) << 16) | ((#<BYTE>pID3[pos+6] & 255) << 8) | (#<BYTE>pID3[pos+7] & 255)
+            ENDIF
+            headSize = 10
+        ELSE
+            frameID = CHR$(charVal) + CHR$(#<BYTE>pID3[pos+1] & 255) + CHR$(#<BYTE>pID3[pos+2] & 255)
+            fSize = ((#<BYTE>pID3[pos+3] & 255) << 16) | ((#<BYTE>pID3[pos+4] & 255) << 8) | (#<BYTE>pID3[pos+5] & 255)
+            headSize = 6
+        ENDIF
+
+        IF fSize <= 0 OR (pos + headSize + fSize) > tagSize THEN BREAK
+
+        matchID = targetID
+        IF version = 2 AND LEN(targetID) = 4 THEN
+            IF targetID = "COMM" THEN matchID = "COM"
+            IF targetID = "USLT" THEN matchID = "ULT"
+        ENDIF
+
+        IF frameID = matchID THEN
+            enc = #<BYTE>pID3[pos + headSize] & 255
+            textStart = pos + headSize + 4 
+            
+            descEnd = textStart
+            IF enc = 1 OR enc = 2 THEN
+                WHILE descEnd < pos + headSize + fSize - 1
+                    IF (#<BYTE>pID3[descEnd] & 255) = 0 AND (#<BYTE>pID3[descEnd+1] & 255) = 0 THEN BREAK
+                    descEnd = descEnd + 2
+                ENDWHILE
+                textStart = descEnd + 2
+            ELSE
+                WHILE descEnd < pos + headSize + fSize
+                    IF (#<BYTE>pID3[descEnd] & 255) = 0 THEN BREAK
+                    descEnd = descEnd + 1
+                ENDWHILE
+                textStart = descEnd + 1
+            ENDIF
+
+            outIdx = 0
+            FOR k = textStart TO pos + headSize + fSize - 1
+                charVal = #<BYTE>pID3[k] & 255
+                IF charVal = 10 OR charVal = 13 THEN
+                    IF outIdx < maxLen - 1 THEN : #<BYTE>pDest[outIdx] = charVal : outIdx = outIdx + 1 : ENDIF
+                ELSEIF charVal >= 32 AND charVal < 254 THEN 
+                    IF outIdx < maxLen - 1 THEN : #<BYTE>pDest[outIdx] = charVal : outIdx = outIdx + 1 : ENDIF
+                ENDIF
+            NEXT k
+            #<BYTE>pDest[outIdx] = 0
+            
+            IF enc = 3 THEN EnsureANSI_InPlace(pDest, maxLen)
+            RETURN
+        ENDIF
+        pos = pos + headSize + fSize
+    ENDWHILE
+ENDSUB
+
+SUB LoadTrackMetadata(DWORD hStream, INT argIdx)
+    IF hStream = 0 THEN RETURN
+
+    totalLenBytes = BASS_ChannelGetLength(hStream)
+    BASS_ChannelGetInfo(hStream, &g_chanInfo)
+
+    IF totalLenBytes > 0q AND g_chanInfo.freq > 0 THEN
+        totalSecs = totalLenBytes / (g_chanInfo.freq * g_chanInfo.chans * 2.0)
+    ELSE
+        totalSecs = 0.0
+    ENDIF
+
+    STRING trackArtist, trackTitle, trackAlbum
+
+    trackArtist = GetVorbisComment(hStream, "ARTIST")
+    IF trackArtist = "" THEN trackArtist = GetRawID3v2(hStream, "TPE1")
+    IF trackArtist = "" THEN trackArtist = GetRawID3v1(g_Playlist[argIdx], "ARTIST")
+    IF trackArtist = "" THEN trackArtist = "Unknown Artist" ELSE trackArtist = ConvertANSItoOEM(EnsureANSI(trackArtist))
+
+    trackTitle = GetVorbisComment(hStream, "TITLE")
+    IF trackTitle = "" THEN trackTitle = GetRawID3v2(hStream, "TIT2")
+    IF trackTitle = "" THEN trackTitle = GetRawID3v1(g_Playlist[argIdx], "TITLE")
+    IF trackTitle = "" THEN trackTitle = GetFileNameOnly(g_Playlist[argIdx]) ELSE trackTitle = ConvertANSItoOEM(EnsureANSI(trackTitle))
+
+    trackAlbum = GetVorbisComment(hStream, "ALBUM")
+    IF trackAlbum = "" THEN trackAlbum = GetRawID3v2(hStream, "TALB")
+    IF trackAlbum = "" THEN trackAlbum = GetRawID3v1(g_Playlist[argIdx], "ALBUM")
+    IF trackAlbum = "" THEN trackAlbum = "Unknown Album" ELSE trackAlbum = ConvertANSItoOEM(EnsureANSI(trackAlbum))
+
+    g_trackYear = GetVorbisComment(hStream, "DATE")
+    IF g_trackYear = "" THEN g_trackYear = GetVorbisComment(hStream, "YEAR")
+    IF g_trackYear = "" THEN g_trackYear = GetRawID3v2(hStream, "TYER")
+    IF g_trackYear = "" THEN g_trackYear = GetRawID3v2(hStream, "TDRC")
+    IF g_trackYear = "" THEN g_trackYear = GetRawID3v1(g_Playlist[argIdx], "YEAR")
+    IF g_trackYear = "" THEN g_trackYear = "----" ELSE g_trackYear = ConvertANSItoOEM(EnsureANSI(g_trackYear))
+    IF LEN(g_trackYear) > 10 THEN g_trackYear = LEFT$(g_trackYear, 10)
+
+    g_trackNum = GetVorbisComment(hStream, "TRACKNUMBER")
+    IF g_trackNum = "" THEN g_trackNum = GetVorbisComment(hStream, "TRACK")
+    IF g_trackNum = "" THEN g_trackNum = GetRawID3v2(hStream, "TRCK")
+    IF g_trackNum = "" THEN g_trackNum = "--" ELSE g_trackNum = ConvertANSItoOEM(EnsureANSI(g_trackNum))
+    IF LEN(g_trackNum) > 8 THEN g_trackNum = LEFT$(g_trackNum, 8)
+
+    g_ExtScroll = 0
+    
+    g_pComments[0] = 0
+    GetVorbisCommentLongPtr(hStream, "COMMENT", g_pComments, 8192)
+    IF g_pComments[0] = 0 THEN GetVorbisCommentLongPtr(hStream, "DESCRIPTION", g_pComments, 8192)
+    IF g_pComments[0] = 0 THEN GetID3v2LongTextPtr(hStream, "COMM", g_pComments, 8192)
+    IF g_pComments[0] <> 0 THEN 
+        EnsureANSI_InPlace(g_pComments, 8192)
+        ConvertANSItoOEM_InPlace(g_pComments)
+        WrapText_InPlace(g_pComments, 60, 8192)
+    ENDIF
+    commentLines = GetTotalLinesPtr(g_pComments)
+    
+    g_pLyrics[0] = 0
+    GetVorbisCommentLongPtr(hStream, "LYRICS", g_pLyrics, 8192)
+    IF g_pLyrics[0] = 0 THEN GetID3v2LongTextPtr(hStream, "USLT", g_pLyrics, 8192)
+    IF g_pLyrics[0] = 0 THEN LoadExternalLRC(g_Playlist[argIdx], g_pLyrics, 8192)
+
+    IF g_pLyrics[0] <> 0 THEN 
+        EnsureANSI_InPlace(g_pLyrics, 8192)
+        ConvertANSItoOEM_InPlace(g_pLyrics)
+    ENDIF
+
+    ParseLRC(g_pLyrics)
+    IF g_IsSyncedLyrics = 0 AND g_pLyrics[0] <> 0 THEN
+        WrapText_InPlace(g_pLyrics, 60, 8192)
+    ENDIF
+    lyricLines = GetTotalLinesPtr(g_pLyrics)
+
+    g_LastActiveLyric = -2
+    g_CommentPage = 0
+    g_CommentTick = 0
+
+    ' Store into global variables for marquee and UI access
+    g_TrackArtist = trackArtist
+    g_TrackTitle  = trackTitle
+    g_TrackAlbum  = trackAlbum
+
+    ' Marquee Padding Strings
+    IF LEN(g_TrackArtist) > 53 THEN g_PadArtist = g_TrackArtist + " || " ELSE g_PadArtist = g_TrackArtist
+    IF LEN(g_TrackTitle)  > 53 THEN g_PadTitle  = g_TrackTitle  + " || " ELSE g_PadTitle  = g_TrackTitle
+    IF LEN(g_TrackAlbum)  > 53 THEN g_PadAlbum  = g_TrackAlbum  + " || " ELSE g_PadAlbum  = g_TrackAlbum
+
+    ' Initial Display Crop
+    IF LEN(g_TrackArtist) > 53 THEN g_DispArtist = LEFT$(g_PadArtist, 53) ELSE g_DispArtist = LEFT$(g_PadArtist + SPACE$(53), 53)
+    IF LEN(g_TrackTitle)  > 53 THEN g_DispTitle  = LEFT$(g_PadTitle, 53)  ELSE g_DispTitle  = LEFT$(g_PadTitle  + SPACE$(53), 53)
+    IF LEN(g_TrackAlbum)  > 53 THEN g_DispAlbum  = LEFT$(g_PadAlbum, 53)  ELSE g_DispAlbum  = LEFT$(g_PadAlbum  + SPACE$(53), 53)
+
+    ' Codec & Channel Format Specs
+    STRING codecStr, chanStr
+    SELECT g_chanInfo.ctype
+        CASE BASS_CTYPE_STREAM_FLAC : codecStr = "FLAC"
+        CASE BASS_CTYPE_STREAM_MP3  : codecStr = "MP3"
+        DEFAULT                     : codecStr = "AUDIO"
+    ENDSELECT
+    
+    IF g_chanInfo.chans = 2 THEN chanStr = "Stereo" ELSE chanStr = "Mono"
+    g_specFmt = codecStr + " / " + LTRIM$(STR$(g_chanInfo.freq / 1000.0)) + " kHz / " + chanStr
+
+    ' Bitrate & File Size Specs
+    DOUBLE fileSizeMB, dBytes
+    QWORD fileSizeBytes
+    INT bitrate = 0
+
+    fileSizeBytes = BASS_StreamGetFilePosition(hStream, BASS_FILEPOS_END)
+    IF fileSizeBytes > 0q AND fileSizeBytes < 10000000000q THEN
+        dBytes = fileSizeBytes : fileSizeMB = dBytes / 1048576.0
+        IF totalSecs > 0.0 THEN bitrate = INT((dBytes * 8.0) / (totalSecs * 1000.0))
+    ELSE
+        fileSizeMB = 0.0
+    ENDIF
+
+    IF bitrate > 0 THEN g_specBit = LTRIM$(STR$(bitrate)) + " kbps" ELSE g_specBit = "Unknown"
+
+    g_specSiz = "Unknown"
+    IF fileSizeMB > 0.0 THEN
+        STRING sizeTmp = LTRIM$(STR$(fileSizeMB))
+        INT dPos = INSTR(sizeTmp, ".")
+        IF dPos > 0 THEN sizeTmp = LEFT$(sizeTmp, dPos + 2)
+        g_specSiz = sizeTmp + " MB"
+    ENDIF
+ENDSUB
+
+SUB DrawExtendedMetadataHUD()
+    ' Prepare metadata strings
+    STRING fullPath = g_Playlist[argIdx]
+    STRING p1 = LEFT$(fullPath, 49)
+    STRING p2 = ""
+    IF LEN(fullPath) > 49 THEN p2 = MID$(fullPath, 50, 49)
+
+    ' Compute file size & bitrate locally
+    QWORD fSizeBytes = BASS_StreamGetFilePosition(hStream, BASS_FILEPOS_END)
+    INT calcBitrate = 0
+    IF fSizeBytes > 0q AND totalSecs > 0.0 THEN
+        DOUBLE dBytes = fSizeBytes
+        calcBitrate = INT((dBytes * 8.0) / (totalSecs * 1000.0))
+    ENDIF
+
+    STRING trackGenre = GetVorbisComment(hStream, "GENRE")
+    IF trackGenre = "" THEN trackGenre = GetRawID3v2(hStream, "TCON")
+    IF trackGenre = "" THEN trackGenre = GetRawID3v1(g_Playlist[argIdx], "GENRE")
+    IF trackGenre = "" THEN trackGenre = "General / Misc" ELSE trackGenre = ConvertANSItoOEM(EnsureANSI(trackGenre))
+
+    STRING tagType = "Standard Stream"
+    IF LCASE$(RIGHT$(fullPath, 5)) = ".flac" THEN
+        tagType = "FLAC Vorbis"
+    ELSEIF GetRawID3v2(hStream, "TIT2") <> "" OR GetRawID3v2(hStream, "TPE1") <> "" THEN
+        tagType = "ID3v2 Tag"
+    ELSEIF GetRawID3v1(g_Playlist[argIdx], "TITLE") <> "" THEN
+        tagType = "ID3v1 Tag"
+    ENDIF
+
+    STRING codecStr = "AUDIO"
+    SELECT g_chanInfo.ctype
+        CASE BASS_CTYPE_STREAM_FLAC : codecStr = "FLAC"
+        CASE BASS_CTYPE_STREAM_MP3  : codecStr = "MP3"
+    ENDSELECT
+
+    STRING chanBitsStr = "Stereo"
+    IF g_chanInfo.chans = 1 THEN chanBitsStr = "Mono"
+    IF g_chanInfo.origres > 0 THEN chanBitsStr = chanBitsStr + " (" + LTRIM$(STR$(g_chanInfo.origres)) + "-bit)"
+
+    STRING freqStr = LTRIM$(STR$(g_chanInfo.freq / 1000.0)) + " kHz"
+    STRING audioFmt = codecStr + " / " + freqStr
+
+    STRING bitStr = "Unknown"
+    IF calcBitrate > 0 THEN bitStr = LTRIM$(STR$(calcBitrate)) + " kbps"
+
+    STRING durStr = FormatTimeStr(totalSecs) + " (" + LTRIM$(STR$(INT(totalSecs))) + "s)"
+
+    STRING prevStr = g_LastPlayedTitle
+    IF prevStr = "" THEN prevStr = "None"
+
+    INT remTracks = g_TrackCount - (argIdx + 1)
+    STRING queueStr = "Track " + LTRIM$(STR$(argIdx + 1)) + " of " + LTRIM$(STR$(g_TrackCount)) + " (" + LTRIM$(STR$(remTracks)) + " remaining)"
+
+    ' Construct CP437 Box Characters (ASCII integer codes avoid compiler warnings)
+    STRING cBL = CHR$(218), cBR = CHR$(191)
+    STRING cVL = CHR$(179), cLT = CHR$(195), cRT = CHR$(180)
+    STRING cEL = CHR$(192), cER = CHR$(217)
+
+    SetColor(colTech)
+    ConsoleWrite(19, 13, cBL + CHR$(196) + " EXTENDED METADATA & FILE INFO " + STRING$(26, 196) + cBR)
+    
+    SetColor(colStatic)
+    ConsoleWrite(19, 14, cVL + " Path  : " + LEFT$(p1 + SPACE$(49), 49) + cVL)
+    ConsoleWrite(19, 15, cVL + "         " + LEFT$(p2 + SPACE$(49), 49) + cVL)
+    
+    SetColor(colTech)
+    ConsoleWrite(19, 16, cLT + STRING$(58, 196) + cRT)
+    
+    SetColor(colStatic)
+    ConsoleWrite(19, 17, cVL + " Genre   : " + LEFT$(trackGenre + SPACE$(16), 16) + " Tag Type : " + LEFT$(tagType + SPACE$(19), 19) + cVL)
+    ConsoleWrite(19, 18, cVL + " Audio   : " + LEFT$(audioFmt + SPACE$(16), 16) + " Channels : " + LEFT$(chanBitsStr + SPACE$(19), 19) + cVL)
+    ConsoleWrite(19, 19, cVL + " Bitrate : " + LEFT$(bitStr + SPACE$(16), 16) + " Duration : " + LEFT$(durStr + SPACE$(19), 19) + cVL)
+    
+    SetColor(colTech)
+    ConsoleWrite(19, 20, cLT + STRING$(58, 196) + cRT)
+    
+    SetColor(colStatic)
+    ConsoleWrite(19, 21, cVL + " Prev    : " + LEFT$(prevStr + SPACE$(47), 47) + cVL)
+    ConsoleWrite(19, 22, cVL + " Queue   : " + LEFT$(queueStr + SPACE$(47), 47) + cVL)
+    
+    SetColor(colTech)
+    ConsoleWrite(19, 23, cEL + STRING$(58, 196) + cER)
+    SetColor(colStatic)
+ENDSUB
+
+SUB DrawSyncedLyrics(DOUBLE currentSecs, INT startX, INT startY, INT lyrTick)
+    INT activeIdx = -1, i, lineIdx
+    STRING lineOut, rawText, padText, dispText
+    
+    FOR i = 0 TO g_SyncedCount - 1
+        IF currentSecs >= g_SyncedLyrics[i].timestamp THEN activeIdx = i
+    NEXT i
+
+    IF activeIdx <> g_LastActiveLyric THEN
+        g_LastActiveLyric = activeIdx
+        g_LyricLineChanged = 1
+    ENDIF
+
+    IF activeIdx = -1 THEN activeIdx = 0
+
+    ' Center active line within 11-line viewport window
+    INT startIdx = activeIdx - 5
+    IF startIdx < 0 THEN startIdx = 0
+    IF startIdx + 11 > g_SyncedCount THEN startIdx = g_SyncedCount - 11
+    IF startIdx < 0 THEN startIdx = 0
+
+    FOR i = 0 TO 10
+        lineIdx = startIdx + i
+        IF lineIdx < g_SyncedCount THEN
+            rawText = g_SyncedLyrics[lineIdx].text
+            
+            IF lineIdx = activeIdx THEN
+                SetColor(colArtist)
+                ' Marquee active line across full 57-char viewport width
+                IF LEN(rawText) > 57 THEN
+                    padText = rawText + " || "
+                    INT mPos = (lyrTick % LEN(padText)) + 1
+                    dispText = LEFT$(MID$(padText, mPos, LEN(padText)) + padText, 57)
+                ELSE
+                    dispText = LEFT$(rawText + SPACE$(57), 57)
+                ENDIF
+                lineOut = ">> " + dispText
+            ELSE
+                SetColor(colStatic)
+                ' Truncate inactive long lines to 57 chars with visual ellipsis
+                IF LEN(rawText) > 57 THEN
+                    dispText = LEFT$(rawText, 54) + "..."
+                ELSE
+                    dispText = LEFT$(rawText + SPACE$(57), 57)
+                ENDIF
+                lineOut = "   " + dispText
+            ENDIF
+            ConsoleWrite(startX, startY + i, lineOut)
+        ELSE
+            ' Blank out empty trailing viewport rows
+            ConsoleWrite(startX, startY + i, SPACE$(60))
+        ENDIF
+    NEXT i
+ENDSUB
+
+SUB DrawTextBoxPtr(POINTER pContent, INT startX, INT startY, INT maxLines, INT scrollOffset)
+    INT i, lineCount = 0, printedCount = 0, cPos = 0
+    ISTRING currentLine[128]
+    INT curLineLen = 0, b
+    
+    FOR i = 0 TO maxLines - 1
+        ConsoleWrite(startX, startY + i, SPACE$(60))
+    NEXT i
+    
+    IF #<BYTE>pContent[0] = 0 THEN RETURN
+    
+    currentLine[0] = 0
+    WHILE #<BYTE>pContent[cPos] <> 0
+        b = #<BYTE>pContent[cPos] & 255
+        IF b = 13 THEN
+            ' Ignore CR
+        ELSEIF b = 10 THEN
+            IF lineCount >= scrollOffset THEN
+                currentLine[curLineLen] = 0
+                ConsoleWrite(startX, startY + printedCount, currentLine)
+                printedCount = printedCount + 1
+            ENDIF
+            curLineLen = 0
+            lineCount = lineCount + 1
+            IF printedCount >= maxLines THEN BREAK
+        ELSE
+            IF curLineLen < 60 THEN
+                currentLine[curLineLen] = b
+                curLineLen = curLineLen + 1
+            ENDIF
+        ENDIF
+        cPos = cPos + 1
+    ENDWHILE
+    
+    IF printedCount < maxLines AND curLineLen > 0 AND lineCount >= scrollOffset THEN
+        currentLine[curLineLen] = 0
+        ConsoleWrite(startX, startY + printedCount, currentLine)
+    ENDIF
+ENDSUB
+
+SUB RefreshExtendedDisplay(POINTER pCom, POINTER pLyr, DOUBLE currentSecs, INT lyrTick)
+    SELECT g_ExtDisplay
+        CASE 1
+            ' View 1: Comments View
+            IF #<BYTE>pCom[0] <> 0 THEN
+                SetColor(colTitle)
+                DrawTextBoxPtr(pCom, 19, 13, 11, g_CommentPage * 11)
+                SetColor(colStatic)
+            ELSE
+                ' No comments available -> Fallback to Metadata HUD
+                DrawExtendedMetadataHUD()
+            ENDIF
+
+        CASE 2
+            ' View 2: Lyrics View (Synced or Static)
+            IF g_IsSyncedLyrics = 1 THEN
+                DrawSyncedLyrics(currentSecs, 19, 13, lyrTick)
+            ELSEIF #<BYTE>pLyr[0] <> 0 THEN
+                SetColor(colArtist)
+                DrawTextBoxPtr(pLyr, 19, 13, 11, g_CommentPage * 11)
+                SetColor(colStatic)
+            ELSE
+                ' No lyrics available -> Fallback to Metadata HUD
+                DrawExtendedMetadataHUD()
+            ENDIF
+
+        CASE 3
+            ' View 3: Extended Metadata HUD
+            DrawExtendedMetadataHUD()
+
+        DEFAULT
+            ' Fallback for 0 or unassigned state -> Default to Metadata HUD (no empty black space)
+            g_ExtDisplay = 3
+            DrawExtendedMetadataHUD()
+    ENDSELECT
+ENDSUB
+
+' ----------------------------------------------------------------------------
+' Main Execution Loop
+' ----------------------------------------------------------------------------
+$MAIN
+OPENCONSOLE
+CLS
+
+UINT gdiToken
+GdiplusStartupInput gdiInput
+gdiInput.GdiplusVersion = 1
+gdiInput.DebugEventCallback = 0
+gdiInput.SuppressBackgroundThread = 0
+gdiInput.SuppressExternalCodecs = 0
+GdiplusStartup(&gdiToken, &gdiInput, 0)
+
+cliArgCount = argc()
+cliArg = GetCommandText()
+
+' Strip outer double quotes and surrounding whitespace unconditionally from CLI argument
+cliArg = LTRIM$(RTRIM$(cliArg))
+WHILE LEFT$(cliArg, 1) = CHR$(34) : cliArg = RIGHT$(cliArg, LEN(cliArg) - 1) : WEND
+WHILE RIGHT$(cliArg, 1) = CHR$(34) : cliArg = LEFT$(cliArg, LEN(cliArg) - 1) : WEND
+cliArg = LTRIM$(RTRIM$(cliArg))
+
+INT isResumeMode = 0
+STRING resumeM3U = GETSTARTPATH() + "cplay.m3u"
+
+' Check for -r / /r flag
+IF LCASE$(cliArg) = "-r" OR LCASE$(cliArg) = "/r" THEN
+    isResumeMode = 1
+    cliArg = resumeM3U
+ENDIF
+
+' Validate input argument presence
+IF cliArgCount > 2 OR cliArg = "" THEN
+    PRINT ""
+    PRINT "  ____,  ____,  __,     ____, _  _, "
+    PRINT " (-/    (-|__) (-|     (-/_| (-\_/  "
+    PRINT "  _\__,  _|     _|__,  _/  |,  _|,  "
+    PRINT " (      (      (      (       (     "
+    PRINT " Fast Console Audio Player      v2.0"
+    PRINT " (c) Y. Dalissier"
+    PRINT ""
+    PRINT "Usage:"
+    PRINT "  cplay.exe <file.flac>"
+    PRINT "  cplay.exe <playlist.m3u>"
+    PRINT "  cplay.exe \"C:\\Music\\*.mp3\"             (recursive)" 
+    PRINT "  cplay.exe -r   (resume cplay.m3u session & position)"
+    PRINT ""
+    RestoreConsoleScreen()
+    CLOSECONSOLE
+    END
+ENDIF
+
+' Create and activate isolated secondary console buffer
+InitConsoleScreen()
+InitEQFrequencies()
+
+PRINT "Loading : Please Wait ..."
+ProcessArgument(cliArg)
+
+IF g_TrackCount = 0 THEN
+    PRINT "Error: No matching audio files found."
+    RestoreConsoleScreen()
+    CLOSECONSOLE : END
+ENDIF
+
+IF InitAudioEngine() = 0 THEN
+    PRINT "Error: Failed to initialize BASS audio driver."
+    RestoreConsoleScreen()
+    CLOSECONSOLE : END
+ENDIF
+
+EnsureDefaultEQProfiles()
+EnumerateAudioDevices()
+LoadConfig()
+SetTheme()
+DrawStaticHUD()
+
+' If launched with -r, force Resume Mode active
+IF isResumeMode = 1 THEN g_ResumePos = 1
+
+' Restore track index if resume is active and index is within valid bounds
+IF g_ResumePos = 1 AND g_LastTrackIdx >= 0 AND g_LastTrackIdx < g_TrackCount THEN
+    argIdx = g_LastTrackIdx
+ELSE
+    argIdx = 0
+    g_LastTrackPos = 0q  ' Clear pos if starting fresh session
+ENDIF
+
+g_History[0] = 0
+g_HistoryPos = 0
+g_HistoryMax = 0
+
+WHILE argIdx < g_TrackCount
+
+    pTrack = g_Playlist[argIdx]
+
+    ' Create stream with Mono Downmix & Prescan support
+    hStream = CreateTrackStream(g_Playlist[argIdx])
+
+    ' Restore byte position if Resume Position is active
+    IF g_ResumePos = 1 AND g_LastTrackPos > 0q AND hStream <> 0 THEN
+        QWORD trackBytes = BASS_ChannelGetLength(hStream)
+        IF g_LastTrackPos < trackBytes THEN
+            BASS_ChannelSetPosition(hStream, g_LastTrackPos)
+        ENDIF
+        ' Clear so subsequent tracks start from beginning
+        g_LastTrackPos = 0q
+    ENDIF
+
+    IF hStream = 0 THEN
+        INT finalErr = BASS_ErrorGetCode()
+        Trace("  -> CRITICAL: BASS_StreamCreateFile FAILED -> Error Code: " + LTRIM$(STR$(finalErr)))
+        SetConsolePos(13, 4)
+        SetColor(C_RED)
+        PRINT "[ERROR] Failed to load track! (Error Code: " + LTRIM$(STR$(finalErr)) + ") Skipping..."
+        SetColor(colStatic)
+        Sleep(1200)
+    ELSE
+        ' Trace("  -> Stream created successfully via CreateTrackStream. Handle: " + LTRIM$(STR$(hStream)))
+
+        ' Fetch active channel attributes & synchronize volume
+        INT curFreq, curVol, curPan
+        BASS_ChannelGetAttributes(hStream, &curFreq, &curVol, &curPan)
+        UpdateStreamVolume(hStream)
+
+        ' Apply all active DSP modules (EQ, Compressor, Reverb)
+        ApplyAllDSP(hStream)
+
+        ' Load initial track metadata
+        LoadTrackMetadata(hStream, argIdx)
+
+        marqueeTick = 0 : marqueeOffset = 0
+
+        ' Initial HUD View Routing
+        SELECT g_InOptionsView
+            CASE 0
+                SetConsolePos(13, 2) : SetColor(colArtist) : PRINT g_DispArtist
+                SetConsolePos(13, 3) : SetColor(colTitle)  : PRINT g_DispTitle
+                SetConsolePos(13, 4) : SetColor(colAlbum)  : PRINT g_DispAlbum
+
+                SetConsolePos(13, 5) : SetColor(colVol)    : PRINT LEFT$(g_trackYear + SPACE$(21), 21)
+                SetConsolePos(42, 5) : SetColor(colVol)    : PRINT LEFT$(g_trackNum + SPACE$(24), 24)
+
+                SetConsolePos(13, 6) : SetColor(colQueue)
+                STRING shufStr
+                IF g_Shuffle = 1 THEN shufStr = "ON " ELSE shufStr = "OFF"
+                PRINT "[" + RIGHT$("     " + LTRIM$(STR$(argIdx + 1)), 5) + " / " + RIGHT$("     " + LTRIM$(STR$(g_TrackCount)), 5) + "]" + SPACE$(26) + "SHUFFLE: " + shufStr
+
+                SetConsolePos(13, 9)  : SetColor(colVol)  : PRINT LEFT$(g_SpecFmt + SPACE$(53), 53)
+                SetConsolePos(13, 10) : SetColor(colTech) : PRINT LEFT$(g_SpecBit + SPACE$(53), 53)
+                SetConsolePos(13, 11) : SetColor(colVol)  : PRINT LEFT$(g_SpecSiz + SPACE$(53), 53)
+
+                RefreshExtendedDisplay(g_pComments, g_pLyrics, 0.0, marqueeOffset)
+                DrawCoverArt(hStream, g_Playlist[argIdx])
+            CASE 1
+                SwitchToOptionsView()
+            CASE 2
+                DrawMoreOptionsScreen()
+        ENDSELECT
+
+        BASS_ChannelPlay(hStream, 0)
+        skipTrack = 0
+
+        ' ====================================================================
+        ' FRAME-BY-FRAME PLAYBACK LOOP
+        ' ====================================================================
+        WHILE (BASS_ChannelIsActive(hStream) = BASS_ACTIVE_PLAYING OR BASS_ChannelIsActive(hStream) = BASS_ACTIVE_PAUSED) AND skipTrack = 0
+            currentPosBytes = BASS_ChannelGetPosition(hStream)
+            IF currentPosBytes > 0q AND g_chanInfo.freq > 0 THEN 
+                currentSecs = currentPosBytes / (g_chanInfo.freq * g_chanInfo.chans * 2.0) 
+            ELSE 
+                currentSecs = 0.0
+            ENDIF
+
+            INT playingState = 0
+            IF BASS_ChannelIsActive(hStream) = BASS_ACTIVE_PLAYING THEN playingState = 1
+
+            ' --- PLAYER VIEW UI RENDERING ---
+            SELECT g_InOptionsView
+                CASE 0
+                    DrawStatusLine(playingState, currentSecs, totalSecs, g_Volume)
+                    SetConsolePos(13, 8) : SetColor(colProg) : DrawProgressBar(currentSecs, totalSecs, 46) : SetColor(colStatic)
+            
+                    vuLevel = BASS_ChannelGetLevel(hStream)
+                    lLevel = 0 : rLevel = 0
+                    IF vuLevel <> -1 THEN
+                        lLevel = vuLevel & 0xFFFF
+                        rLevel = (vuLevel / 65536) & 0xFFFF
+                    ENDIF
+                    DrawVerticalMeter(lLevel, rLevel, 73, 2, 10)
+
+                    marqueeTick = marqueeTick + 1
+                    IF marqueeTick >= 5 THEN
+                        marqueeTick = 0 : marqueeOffset = marqueeOffset + 1
+                        IF LEN(g_TrackArtist) > 53 THEN
+                            mArt = (marqueeOffset % LEN(g_PadArtist)) + 1
+                            g_DispArtist = LEFT$(MID$(g_PadArtist, mArt, LEN(g_PadArtist)) + g_PadArtist, 53)
+                            SetConsolePos(13, 2) : SetColor(colArtist) : PRINT g_DispArtist
+                        ENDIF
+                        IF LEN(g_TrackTitle) > 53 THEN
+                            mTit = (marqueeOffset % LEN(g_PadTitle)) + 1
+                            g_DispTitle = LEFT$(MID$(g_PadTitle, mTit, LEN(g_PadTitle)) + g_PadTitle, 53)
+                            SetConsolePos(13, 3) : SetColor(colTitle) : PRINT g_DispTitle
+                        ENDIF
+                        IF LEN(g_TrackAlbum) > 53 THEN
+                            mAlb = (marqueeOffset % LEN(g_PadAlbum)) + 1
+                            g_DispAlbum = LEFT$(MID$(g_PadAlbum, mAlb, LEN(g_PadAlbum)) + g_PadAlbum, 53)
+                            SetConsolePos(13, 4) : SetColor(colAlbum) : PRINT g_DispAlbum
+                        ENDIF
+                        SetColor(colStatic)
+
+                        IF g_ExtDisplay <> 0 AND ((g_ExtDisplay = 1 AND g_pComments[0] = 0) OR (g_ExtDisplay = 2 AND g_pLyrics[0] = 0 AND g_IsSyncedLyrics = 0)) THEN
+                            RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                        ENDIF
+                    ENDIF
+
+                    UINT conHwnd = GetConsoleWindow()
+                    IF IsIconic(conHwnd) <> 0 THEN
+                        wasMinimized = 1
+                    ELSE
+                        IF wasMinimized = 1 THEN
+                            Sleep(100)
+                            DrawCoverArt(hStream, g_Playlist[argIdx])
+                            wasMinimized = 0
+                        ENDIF
+                    ENDIF
+
+                    IF g_ExtDisplay = 2 AND g_IsSyncedLyrics = 1 THEN
+                        RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                        IF g_LyricLineChanged = 1 THEN
+                            DrawCoverArt(hStream, g_Playlist[argIdx])
+                            g_LyricLineChanged = 0
+                        ENDIF
+                    ENDIF
+            ENDSELECT
+
+            ' ================================================================
+            ' HARDWARE & KEYBOARD INPUT DISPATCHER
+            ' ================================================================
+            SELECT (GetForegroundWindow() = GetConsoleWindow())
+                CASE 1
+                    SELECT g_InOptionsView
+                        CASE 2
+                            ' ================================================
+                            ' EXTENDED OPTIONS VIEW INPUT DISPATCHER (g_InOptionsView = 2)
+                            ' ================================================
+                            ' Vertical Navigation
+                            IF (GetAsyncKeyState(0x26) & 0x8000) <> 0 THEN ' UP
+                                IF optUpDown = 0 THEN
+                                    optUpDown = 1
+                                    IF g_MoreFocus > 0 THEN g_MoreFocus = g_MoreFocus - 1 : DrawMoreOptionsScreen()
+                                ENDIF
+                            ELSE : optUpDown = 0 : ENDIF
+
+                            IF (GetAsyncKeyState(0x28) & 0x8000) <> 0 THEN ' DOWN
+                                IF optDownDown = 0 THEN
+                                    optDownDown = 1
+                                    IF g_MoreFocus < 4 THEN g_MoreFocus = g_MoreFocus + 1 : DrawMoreOptionsScreen()
+                                ENDIF
+                            ELSE : optDownDown = 0 : ENDIF
+
+                            ' Horizontal Adjustment (Left / Right)
+                            IF (GetAsyncKeyState(0x25) & 0x8000) <> 0 THEN ' LEFT
+                                IF optLeftDown = 0 THEN
+                                    optLeftDown = 1
+                                    SELECT g_MoreFocus
+                                        CASE 0 ' Balance Left
+                                            IF g_Balance > -100 THEN g_Balance = g_Balance - 5
+                                            ApplyAudioAttributes(hStream)
+                                            DrawMoreOptionsScreen()
+                                        CASE 2 ' Output Device Prev
+                                            IF g_SelectedDevice > 0 THEN SwitchAudioOutputDevice(g_SelectedDevice - 1)
+                                            DrawMoreOptionsScreen()
+                                        CASE 3 ' Crossfade Decrease
+                                            IF g_Crossfade > 0 THEN g_Crossfade = g_Crossfade - 1
+                                            DrawMoreOptionsScreen()
+                                    ENDSELECT
+                                ENDIF
+                            ELSE : optLeftDown = 0 : ENDIF
+
+                            IF (GetAsyncKeyState(0x27) & 0x8000) <> 0 THEN ' RIGHT
+                                IF optRightDown = 0 THEN
+                                    optRightDown = 1
+                                    SELECT g_MoreFocus
+                                        CASE 0 ' Balance Right
+                                            IF g_Balance < 100 THEN g_Balance = g_Balance + 5
+                                            ApplyAudioAttributes(hStream)
+                                            DrawMoreOptionsScreen()
+                                        CASE 2 ' Output Device Next
+                                            IF g_SelectedDevice < g_AudioDeviceCount - 1 THEN SwitchAudioOutputDevice(g_SelectedDevice + 1)
+                                            DrawMoreOptionsScreen()
+                                        CASE 3 ' Crossfade Increase
+                                            IF g_Crossfade < 5 THEN g_Crossfade = g_Crossfade + 1
+                                            DrawMoreOptionsScreen()
+                                    ENDSELECT
+                                ENDIF
+                            ELSE : optRightDown = 0 : ENDIF
+
+                            ' Key Press Actions
+                            keyPress = LCASE$(INKEY$)
+                            IF keyPress <> "" THEN
+                                SELECT keyPress
+                                    CASE " " ' Spacebar Toggle
+                                        SELECT g_MoreFocus
+                                            CASE 0 : g_Balance = 0 : ApplyAudioAttributes(hStream)
+                                            CASE 1
+                                                g_MonoDownmix = 1 - g_MonoDownmix
+                                                IF hStream <> 0 THEN
+                                                    QWORD curPos = BASS_ChannelGetPosition(hStream)
+                                                    INT isPlay = BASS_ChannelIsActive(hStream)
+                                                    BASS_ChannelStop(hStream)
+                                                    BASS_StreamFree(hStream)
+                                                    hStream = CreateTrackStream(g_Playlist[argIdx])
+                                                    ApplyAllDSP(hStream)
+                                                    BASS_ChannelSetPosition(hStream, curPos)
+                                                    IF isPlay = BASS_ACTIVE_PLAYING THEN BASS_ChannelPlay(hStream, 0)
+                                                ENDIF
+                                             CASE 2 ' Cycle through available devices
+                                                INT nextDev = (g_SelectedDevice + 1) % g_AudioDeviceCount
+                                                SwitchAudioOutputDevice(nextDev)
+                                             CASE 3 : g_Gapless = 1 - g_Gapless
+                                             CASE 4 : g_Crossfade = g_Crossfade + 1 : IF g_Crossfade > 5 THEN g_Crossfade = 0
+                                             CASE 5 : g_ResumePos = 1 - g_ResumePos
+                                        ENDSELECT
+                                        DrawMoreOptionsScreen()
+
+                                    CASE CHR$(27) ' ESC -> Return to Main Options Screen (g_InOptionsView = 1)
+                                        SwitchToOptionsView()
+                                ENDSELECT
+                            ENDIF
+
+                        CASE 1
+                            ' ================================================
+                            ' MAIN OPTIONS VIEW INPUT DISPATCHER (g_InOptionsView = 1)
+                            ' ================================================
+                            SELECT g_SavePromptActive
+                                CASE 1
+                                    ' ----------------------------------------
+                                    ' MODAL MODE: SAVE PRESET NAME PROMPT
+                                    ' ----------------------------------------
+                                    keyPress = INKEY$
+                                    IF keyPress <> "" THEN
+                                        INT ascVal = ASC(keyPress)
+                                        SELECT ascVal
+                                            CASE 13 ' Enter -> Write .eq profile & re-apply DSP
+                                                IF LEN(g_SaveNameBuf) > 0 THEN
+                                                    Save10BandEQConfig(g_SaveNameBuf)
+                                                    ApplyAllDSP(hStream)
+                                                ENDIF
+                                                g_SavePromptActive = 0
+                                                DrawOptionsScreen()
+
+                                            CASE 27 ' Esc -> Cancel prompt
+                                                g_SavePromptActive = 0
+                                                DrawOptionsScreen()
+
+                                            CASE 8  ' Backspace -> Delete character
+                                                IF LEN(g_SaveNameBuf) > 0 THEN
+                                                    g_SaveNameBuf = LEFT$(g_SaveNameBuf, LEN(g_SaveNameBuf) - 1)
+                                                    DrawOptionsScreen()
+                                                ENDIF
+
+                                            DEFAULT ' Printable Character Entry
+                                                IF ascVal >= 32 AND ascVal <= 126 AND LEN(g_SaveNameBuf) < 30 THEN
+                                                    IF ascVal <> 92 AND ascVal <> 47 AND ascVal <> 58 AND ascVal <> 42 AND ascVal <> 63 AND ascVal <> 34 AND ascVal <> 60 AND ascVal <> 62 AND ascVal <> 124 THEN
+                                                        g_SaveNameBuf = g_SaveNameBuf + keyPress
+                                                        DrawOptionsScreen()
+                                                    ENDIF
+                                                ENDIF
+                                        ENDSELECT
+                                    ENDIF
+
+                                CASE 0
+                                ' ----------------------------------------
+                                ' STANDARD OPTIONS VIEW NAVIGATION (3-PANEL)
+                                ' ----------------------------------------
+                                ' Tab Key Panel Cycling (0: DSP List -> 1: Presets -> 2: EQ Form)
+                                IF (GetAsyncKeyState(0x09) & 0x8000) <> 0 THEN
+                                    IF optTabDown = 0 THEN
+                                        optTabDown = 1
+                                        g_OptionsFocus = (g_OptionsFocus + 1) % 3
+                                        DrawOptionsScreen()
+                                    ENDIF
+                                ELSE
+                                    optTabDown = 0
+                                ENDIF
+
+                                SELECT g_OptionsFocus
+                                    CASE 0
+                                        ' ----------------------------------------------------
+                                        ' PANEL 0: AUDIO DSP MODULES LISTBOX (TOP-LEFT)
+                                        ' ----------------------------------------------------
+                                        IF (GetAsyncKeyState(0x26) & 0x8000) <> 0 THEN ' UP
+                                            IF optUpDown = 0 THEN
+                                                optUpDown = 1
+                                                IF g_DspSelectedIndex > 0 THEN
+                                                    g_DspSelectedIndex = g_DspSelectedIndex - 1
+                                                    DrawOptionsScreen()
+                                                ENDIF
+                                            ENDIF
+                                        ELSE
+                                            optUpDown = 0
+                                        ENDIF
+
+                                        IF (GetAsyncKeyState(0x28) & 0x8000) <> 0 THEN ' DOWN
+                                            IF optDownDown = 0 THEN
+                                                optDownDown = 1
+                                                IF g_DspSelectedIndex < 5 THEN
+                                                    g_DspSelectedIndex = g_DspSelectedIndex + 1
+                                                    DrawOptionsScreen()
+                                                ENDIF
+                                            ENDIF
+                                        ELSE
+                                            optDownDown = 0
+                                        ENDIF
+
+                                    CASE 1
+                                        ' ----------------------------------------------------
+                                        ' PANEL 1: PRESET LISTBOX (BOTTOM-LEFT)
+                                        ' ----------------------------------------------------
+                                        IF (GetAsyncKeyState(0x26) & 0x8000) <> 0 THEN ' UP
+                                            IF optUpDown = 0 THEN
+                                                optUpDown = 1
+                                                IF g_EqSelectedIndex > 0 THEN
+                                                    g_EqSelectedIndex = g_EqSelectedIndex - 1
+                                                    Parse10BandEQConfig(g_EqFileList[g_EqSelectedIndex])
+                                                    DrawOptionsScreen()
+                                                ENDIF
+                                            ENDIF
+                                        ELSE
+                                            optUpDown = 0
+                                        ENDIF
+
+                                        IF (GetAsyncKeyState(0x28) & 0x8000) <> 0 THEN ' DOWN
+                                            IF optDownDown = 0 THEN
+                                                optDownDown = 1
+                                                IF g_EqSelectedIndex < g_EqFileCount - 1 THEN
+                                                    g_EqSelectedIndex = g_EqSelectedIndex + 1
+                                                    Parse10BandEQConfig(g_EqFileList[g_EqSelectedIndex])
+                                                    DrawOptionsScreen()
+                                                ENDIF
+                                            ENDIF
+                                        ELSE
+                                            optDownDown = 0
+                                        ENDIF
+
+                                        IF (GetAsyncKeyState(0x0D) & 0x8000) <> 0 THEN ' ENTER
+                                            IF optEnterDown = 0 THEN
+                                                optEnterDown = 1
+                                                IF g_EqFileCount > 0 AND g_EqSelectedIndex < g_EqFileCount THEN
+                                                    g_EqProfile = g_EqFileList[g_EqSelectedIndex]
+                                                    ApplyAllDSP(hStream)
+                                                    SaveConfig()
+                                                    DrawOptionsScreen()
+                                                ENDIF
+                                            ENDIF
+                                        ELSE
+                                            optEnterDown = 0
+                                        ENDIF
+
+                                    CASE 2
+                                        ' ----------------------------------------------------
+                                        ' PANEL 2: 10-BAND EQ PARAMETER FORM (RIGHT PANEL)
+                                        ' ----------------------------------------------------
+                                        IF (GetAsyncKeyState(0x26) & 0x8000) <> 0 THEN ' UP
+                                            IF optUpDown = 0 THEN
+                                                optUpDown = 1
+                                                IF g_SelectedEqBand > 0 THEN
+                                                    g_SelectedEqBand = g_SelectedEqBand - 1
+                                                    DrawOptionsScreen()
+                                                ENDIF
+                                            ENDIF
+                                        ELSE
+                                            optUpDown = 0
+                                        ENDIF
+
+                                        IF (GetAsyncKeyState(0x28) & 0x8000) <> 0 THEN ' DOWN
+                                            IF optDownDown = 0 THEN
+                                                optDownDown = 1
+                                                IF g_SelectedEqBand < 9 THEN
+                                                    g_SelectedEqBand = g_SelectedEqBand + 1
+                                                    DrawOptionsScreen()
+                                                ENDIF
+                                            ENDIF
+                                        ELSE
+                                            optDownDown = 0
+                                        ENDIF
+
+                                        IF (GetAsyncKeyState(0x25) & 0x8000) <> 0 THEN ' LEFT
+                                            IF optLeftDown = 0 THEN
+                                                optLeftDown = 1
+                                                IF g_EqGains[g_SelectedEqBand] > -12 THEN
+                                                    g_EqGains[g_SelectedEqBand] = g_EqGains[g_SelectedEqBand] - 0.5
+                                                    UpdateBASSBand(g_SelectedEqBand)
+                                                    RecalculateEqPrecut()
+                                                    DrawOptionsScreen()
+                                                ENDIF
+                                            ENDIF
+                                        ELSE
+                                            optLeftDown = 0
+                                        ENDIF
+
+                                        IF (GetAsyncKeyState(0x27) & 0x8000) <> 0 THEN ' RIGHT
+                                            IF optRightDown = 0 THEN
+                                                optRightDown = 1
+                                                IF g_EqGains[g_SelectedEqBand] < 12 THEN
+                                                    g_EqGains[g_SelectedEqBand] = g_EqGains[g_SelectedEqBand] + 0.5
+                                                    UpdateBASSBand(g_SelectedEqBand)
+                                                    RecalculateEqPrecut()
+                                                    DrawOptionsScreen()
+                                                ENDIF
+                                            ENDIF
+                                        ELSE
+                                            optRightDown = 0
+                                        ENDIF
+                                ENDSELECT
+
+                                ' Character Keys Dispatcher
+                                keyPress = LCASE$(INKEY$)
+                                IF keyPress <> "" THEN
+                                    SELECT keyPress
+                                        CASE " " ' Spacebar Toggles focused module in Panel 0
+                                            IF g_OptionsFocus = 0 THEN
+                                                SELECT g_DspSelectedIndex
+                                                    CASE 0 : g_EqEnabled      = 1 - g_EqEnabled      : ApplyEqProfile(hStream)
+                                                    CASE 1 : g_NormEnabled    = 1 - g_NormEnabled    : UpdateStreamVolume(hStream)
+                                                    CASE 2 : g_CompEnabled    = 1 - g_CompEnabled    : ApplyCompressor(hStream)
+                                                    CASE 3 : g_ReverbEnabled  = 1 - g_ReverbEnabled  : ApplyReverb(hStream)
+                                                    CASE 4 : g_TubeEnabled    = 1 - g_TubeEnabled    : ApplyTubeWarmth(hStream)
+                                                    CASE 5 : g_WidenerEnabled = 1 - g_WidenerEnabled : ApplyStereoWidener(hStream)
+                                                ENDSELECT
+                                                SaveConfig()
+                                                DrawOptionsScreen()
+                                            ENDIF
+
+                                        CASE "m"
+                                            SwitchToMoreOptionsView()
+
+                                        CASE "o"
+                                        CASE& CHR$(27)
+                                            RedrawPlayerView()
+
+                                        CASE "s"
+                                            g_SavePromptActive = 1
+                                            IF g_EqFileCount > 0 AND g_EqSelectedIndex < g_EqFileCount THEN
+                                                g_SaveNameBuf = g_EqFileList[g_EqSelectedIndex]
+                                            ELSE
+                                                g_SaveNameBuf = "Custom.eq"
+                                            ENDIF
+                                            DrawOptionsScreen()
+                                    ENDSELECT
+                                ENDIF
+                            ENDSELECT
+
+                        CASE 0
+                            ' ================================================
+                            ' PLAYER VIEW HARDWARE & KEYBOARD INPUT (g_InOptionsView = 0)
+                            ' ================================================
+                            IF (GetAsyncKeyState(0x25) & 0x8000) <> 0 THEN
+                                IF leftDown = 0 THEN
+                                    leftDown = 1
+                                    offsetBytes = 5.0 * (g_chanInfo.freq * g_chanInfo.chans * 2.0)
+                                    IF currentPosBytes > offsetBytes THEN newPosBytes = currentPosBytes - offsetBytes ELSE newPosBytes = 0q
+                                    BASS_ChannelSetPosition(hStream, newPosBytes)
+                                ENDIF
+                            ELSE
+                                leftDown = 0
+                            ENDIF
+
+                            IF (GetAsyncKeyState(0x27) & 0x8000) <> 0 THEN
+                                IF rightDown = 0 THEN
+                                    rightDown = 1
+                                    offsetBytes = 5.0 * (g_chanInfo.freq * g_chanInfo.chans * 2.0)
+                                    newPosBytes = currentPosBytes + offsetBytes
+                                    IF newPosBytes > totalLenBytes THEN newPosBytes = totalLenBytes
+                                    BASS_ChannelSetPosition(hStream, newPosBytes)
+                                ENDIF
+                            ELSE
+                                rightDown = 0
+                            ENDIF
+
+                            IF (GetAsyncKeyState(0x26) & 0x8000) <> 0 THEN
+                                IF upDown = 0 THEN
+                                    upDown = 1 : g_Volume = g_Volume + 5 : IF g_Volume > 100 THEN g_Volume = 100
+                                    UpdateStreamVolume(hStream)
+                                    DrawStatusLine(playingState, currentSecs, totalSecs, g_Volume)
+                                ENDIF
+                            ELSE
+                                upDown = 0
+                            ENDIF
+
+                            IF (GetAsyncKeyState(0x28) & 0x8000) <> 0 THEN
+                                IF downDown = 0 THEN
+                                    downDown = 1 : g_Volume = g_Volume - 5 : IF g_Volume < 0 THEN g_Volume = 0
+                                    UpdateStreamVolume(hStream)
+                                    DrawStatusLine(playingState, currentSecs, totalSecs, g_Volume)
+                                ENDIF
+                            ELSE
+                                downDown = 0
+                            ENDIF
+
+                            g_CommentTick = g_CommentTick + 1
+                            IF g_CommentTick >= 300 THEN
+                                g_CommentTick = 0
+                                g_CommentPage = g_CommentPage + 1
+
+                                SELECT g_ExtDisplay
+                                    CASE 1
+                                        IF g_pComments[0] <> 0 THEN
+                                            IF g_CommentPage * 11 >= commentLines THEN g_CommentPage = 0
+                                            RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                                        ENDIF
+                                    CASE 2
+                                        IF g_IsSyncedLyrics = 0 AND g_pLyrics[0] <> 0 THEN
+                                            IF g_CommentPage * 11 >= lyricLines THEN g_CommentPage = 0
+                                            RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                                        ENDIF
+                                ENDSELECT
+                            ENDIF
+
+                            keyPress = LCASE$(INKEY$)
+                            IF keyPress <> "" THEN
+                                SELECT keyPress
+                                    CASE "q"
+                                        BASS_ChannelStop(hStream) : GOTO CleanupExit
+                                    CASE "n"
+                                        skipTrack = 1
+                                    CASE "p"
+                                        skipTrack = -1
+                                    CASE " "
+                                        IF BASS_ChannelIsActive(hStream) = BASS_ACTIVE_PLAYING THEN BASS_ChannelPause(hStream) ELSE BASS_ChannelPlay(hStream, 0)
+                                    CASE "s"
+                                        g_Shuffle = 1 - g_Shuffle
+                                        IF g_Shuffle = 1 THEN shufStr = "ON " ELSE shufStr = "OFF"
+                                        SetConsolePos(13, 6) : SetColor(colQueue)
+                                        PRINT "[" + RIGHT$("     " + LTRIM$(STR$(argIdx + 1)), 5) + " / " + RIGHT$("     " + LTRIM$(STR$(g_TrackCount)), 5) + "]" + SPACE$(26) + "SHUFFLE: " + shufStr
+                                    CASE "c"
+                                        IF g_ExtDisplay = 1 THEN g_ExtDisplay = 0 ELSE g_ExtDisplay = 1
+                                        g_CommentPage = 0 : g_CommentTick = 0 : g_LastActiveLyric = -2
+                                        RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                                    CASE "l"
+                                        IF g_ExtDisplay = 2 THEN g_ExtDisplay = 0 ELSE g_ExtDisplay = 2
+                                        g_CommentPage = 0 : g_CommentTick = 0 : g_LastActiveLyric = -2
+                                        RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                                    CASE "o"
+                                        SwitchToOptionsView()
+                                    CASE "t"
+                                        g_Theme = g_Theme + 1 : IF g_Theme > 6 THEN g_Theme = 0
+                                        SetTheme()
+                                        SetConsolePos(13, 2) : SetColor(colArtist) : PRINT g_DispArtist
+                                        SetConsolePos(13, 3) : SetColor(colTitle)  : PRINT g_DispTitle
+                                        SetConsolePos(13, 4) : SetColor(colAlbum)  : PRINT g_DispAlbum
+                                        SetConsolePos(13, 5) : SetColor(colVol)    : PRINT LEFT$(g_trackYear + SPACE$(21), 21)
+                                        SetConsolePos(42, 5) : SetColor(colVol)    : PRINT LEFT$(g_trackNum + SPACE$(24), 24)
+                                        SetConsolePos(13, 6) : SetColor(colQueue)
+                                        IF g_Shuffle = 1 THEN shufStr = "ON " ELSE shufStr = "OFF"
+                                        PRINT "[" + RIGHT$("     " + LTRIM$(STR$(argIdx + 1)), 5) + " / " + RIGHT$("     " + LTRIM$(STR$(g_TrackCount)), 5) + "]" + SPACE$(26) + "SHUFFLE: " + shufStr
+                                        
+                                        SetConsolePos(13, 9)  : SetColor(colVol)  : PRINT LEFT$(g_SpecFmt + SPACE$(53), 53)
+                                        SetConsolePos(13, 10) : SetColor(colTech) : PRINT LEFT$(g_SpecBit + SPACE$(53), 53)
+                                        SetConsolePos(13, 11) : SetColor(colVol)  : PRINT LEFT$(g_SpecSiz + SPACE$(53), 53)
+
+                                        g_LastActiveLyric = -2
+                                        RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                                        DrawCoverArt(hStream, g_Playlist[argIdx])
+                                ENDSELECT
+                            ENDIF
+                    ENDSELECT
+
+            ENDSELECT
+
+            ' Pass addresses via & to allow in-place handle swapping
+            CheckStreamTransition(&hStream, &argIdx)
+
+            Sleep(50)
+        WEND
+        
+        BASS_ChannelStop(hStream)
+        BASS_StreamFree(hStream)
+        
+        IF g_TrackTitle <> "" THEN
+            g_LastPlayedTitle = g_TrackArtist + " - " + g_TrackTitle
+        ENDIF
+    ENDIF
+
+    IF skipTrack = -1 THEN
+        IF g_HistoryPos > 0 THEN
+            g_HistoryPos = g_HistoryPos - 1
+            argIdx = g_History[g_HistoryPos]
+        ELSE
+            argIdx = g_History[0]
+        ENDIF
+    ELSE
+        IF g_Played[argIdx] = 0 THEN
+            g_Played[argIdx] = 1
+            g_PlayedCount = g_PlayedCount + 1
+        ENDIF
+        
+        IF g_HistoryPos < g_HistoryMax THEN
+            g_HistoryPos = g_HistoryPos + 1
+            argIdx = g_History[g_HistoryPos]
+        ELSE
+            IF g_PlayedCount >= g_TrackCount THEN
+                argIdx = g_TrackCount
+            ELSE
+                SELECT g_Shuffle
+                    CASE 1
+                        INT unplayedTarget = INT(RND(g_TrackCount - g_PlayedCount)) + 1
+                        INT currentUnplayed = 0, scanIdx = 0
+                        WHILE scanIdx < g_TrackCount
+                            IF LEN(g_Playlist[scanIdx]) > 0 THEN
+                                IF g_Played[scanIdx] = 0 THEN
+                                    currentUnplayed = currentUnplayed + 1
+                                    IF currentUnplayed = unplayedTarget THEN 
+                                        argIdx = scanIdx 
+                                        scanIdx = g_TrackCount 
+                                    ENDIF
+                                ENDIF
+                            ENDIF
+                            scanIdx = scanIdx + 1
+                        ENDWHILE
+                    CASE 0
+                        argIdx = argIdx + 1
+                        WHILE argIdx < g_TrackCount AND (g_Played[argIdx] = 1 OR LEN(g_Playlist[argIdx]) = 0)
+                            argIdx = argIdx + 1
+                        ENDWHILE
+                ENDSELECT
+                
+                IF argIdx < g_TrackCount THEN
+                    g_HistoryMax = g_HistoryMax + 1
+                    g_HistoryPos = g_HistoryMax
+                    g_History[g_HistoryPos] = argIdx
+                ENDIF
+            ENDIF
+        ENDIF
+    ENDIF
+ENDWHILE
+
+LABEL CleanupExit
+IF g_ResumePos = 1 AND hStream <> 0 THEN
+    g_LastTrackIdx = argIdx
+    g_LastTrackPos = BASS_ChannelGetPosition(hStream)
+ENDIF
+
+IF g_hOldFadingStream <> 0 THEN
+    BASS_ChannelStop(g_hOldFadingStream)
+    BASS_StreamFree(g_hOldFadingStream)
+    g_hOldFadingStream = 0
+ENDIF
+
+CLS
+PRINT "Saving config & playlist..."
+SaveConfig()
+SavePlaylistM3U()
+PRINT "Done !"
+GdiplusShutdown(gdiToken)
+BASS_Free()
+
+' Switch back to original host shell screen buffer
+RestoreConsoleScreen()
+PRINT "Keep the retro vibes alive ! Returning to shell..."
+CLOSECONSOLE
+END
