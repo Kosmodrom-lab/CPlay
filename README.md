@@ -1,3 +1,7 @@
+![Platform](https://img.shields.io/badge/Platform-Windows%207%20%7C%208%20%7C%2010%20%7C%2011-blue)
+![Language](https://img.shields.io/badge/Language-IWBasic%202.5-orange)
+![License](https://img.shields.io/badge/License-Freeware-green)
+![Status](https://img.shields.io/badge/Status-Portable-brightgreen)
 # CPlay - Fast Console Audio Player
 
 A lightweight retro console audio player built in **IWBasic 2.5**. Powered by the Un4seen BASS audio engine (`bass.dll` and `bassflac.dll`), **CPlay** pairs a high-performance CP437 retro text HUD with advanced real-time DSP, 10-Band ISO equalizing, dynamic album art rendering, and synchronized LRC lyrics.
