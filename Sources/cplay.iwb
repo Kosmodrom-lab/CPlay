@@ -11,13 +11,17 @@ $USE "bassflac.lib"
 $USE "ctl.lib"
 $USE "gdiplus.lib"
 $USE "normaliz.lib"
+$USE "ntdll.lib"
 
 $INCLUDE "windowssdk.inc"
 $INCLUDE "fletchie_ctl.inc"
 $INCLUDE "bass22.inc"
 $INCLUDE "gdiplus.inc"
 
+
+
 DECLARE IMPORT, API_LineTo ALIAS "LineTo"(UINT hdc, INT x, INT y), INT
+DECLARE IMPORT, API_RtlCompareMemory ALIAS "RtlCompareMemory"(POINTER Source1, POINTER Source2, DWORD Length), DWORD
 DECLARE IMPORT, NormalizeString(INT NormForm, POINTER lpSrcString, INT cwSrcLength, POINTER lpDstString, INT cwDstLength), INT
 
 ' --- BASS Declarations ---
@@ -28,6 +32,7 @@ CONST NormalizationC = 1
 CONST CP_OEMCP = 1
 CONST CP_UTF8  = 65001
 CONST MB_ERR_INVALID_CHARS = 8
+CONST MARQUEE_SPEED_DIV = 150  ' 150 frames * 50ms = 7500ms per character step
 
 ' ----------------------------------------------------------------------------
 ' BASS Constants & Types
@@ -81,6 +86,7 @@ CONST BASS_FX_DX8_REVERB     = 8
 CONST BASS_ATTRIB_PAN = 3
 CONST BASS_SAMPLE_MONO = 0x0002
 
+
 ' ----------------------------------------------------------------------------
 ' Win32 Console Color Constants
 ' ----------------------------------------------------------------------------
@@ -128,9 +134,50 @@ INT g_PlaylistSelectIdx       = 0   ' Focused row index in filtered list
 INT g_PlaylistScrollOffset    = 0   ' Top visible row in viewport
 INT g_ManualJump              = 0   ' 1 = Manual track selection from Browser
 
+TYPE CHAR_INFO
+    WORD BufChar
+    WORD Attributes
+ENDTYPE
+
+' --- DIRECT VIDEO MEMORY BLITTING BUFFER (80x27) ---
+CHAR_INFO g_FrameBuf[2160]
+' Shadow buffer array for top HUD (80 cols * 13 rows = 1040 CHAR_INFO cells)
+CHAR_INFO g_PrevTopBuf[1040]
+' Shadow buffer array for extended region (80 cols * 11 rows = 880 CHAR_INFO cells)
+CHAR_INFO g_PrevExtBuf[880]
+
+' Cover Art
+UINT g_hCoverBmp   = 0
+UINT g_hCoverDC    = 0
+UINT g_hOldBmp     = 0
+INT  g_CoverW      = 0
+INT  g_CoverH      = 0
+
+' --- MICROSECOND FRAME PACING GLOBALS ---
+INT64 g_qpfFreq        = 0q
+INT   g_ticksPerMs     = 0
+INT64 g_qpcTargetTicks = 0q
+INT64 g_qpcFrameStart  = 0q
+
 ' Playlist Marquee Animation Tickers
 INT plMarqueeTick             = 0
 INT plMarqueeOffset           = 0
+
+' --- ZERO-ALLOCATION MARQUEE GLOBAL BUFFERS ---
+' Main Player Metadata Ring Buffers
+STRING g_RingArtist[512], g_RingTitle[512], g_RingAlbum[512]
+INT    g_PeriodArtist = 0, g_PeriodTitle = 0, g_PeriodAlbum = 0
+STRING g_DispArtistBuf[64], g_DispTitleBuf[64], g_DispAlbumBuf[64]
+
+' Playlist Browser Ring Buffer
+STRING g_PlMarqueeRing[1024]
+STRING g_PlMarqueeDisp[64]
+INT    g_PlMarqueePeriod = 0
+
+' Synced Lyrics Active Line Ring Buffer
+STRING g_LyrMarqueeRing[512]
+STRING g_LyrMarqueeDisp[64]
+INT    g_LyrMarqueePeriod = 0
 
 ' Priority Queue for [P] Play All Filtered
 INT g_PriorityQueue[MAX_PLAYLIST]
@@ -259,7 +306,7 @@ INT colStatic, colArtist, colTitle, colAlbum, colQueue, colVol
 INT colStatusPlay, colStatusPause, colProg, colVU, colTech
 
 ' Display and input buffers
-INT mArt, mTit, mAlb
+' INT mArt, mTit, mAlb
 STRING cliArg
 INT argIdx, cliArgCount
 
@@ -361,6 +408,19 @@ SUB RestoreConsoleScreen()
     ENDIF
 ENDSUB
 
+SUB GetMarqueeSlice(POINTER pRingStr, INT periodLen, INT offset, INT dispLen, POINTER pOutBuf)
+    IF periodLen > 0 THEN
+        INT realOffset = offset % periodLen
+        ' Direct 1-byte stride pointer math + Win32 memory block copy
+        RtlMoveMemory(pOutBuf, pRingStr + realOffset, dispLen)
+    ELSE
+        RtlMoveMemory(pOutBuf, pRingStr, dispLen)
+    ENDIF
+    
+    ' Correct IWBasic pointer indexing for byte assignment at offset dispLen
+    #<BYTE>pOutBuf[dispLen] = 0
+ENDSUB
+
 SUB RedrawPlayerView()
     IF hPlayBuffer = 0 OR hPlayBuffer = -1 THEN RETURN
 
@@ -370,32 +430,31 @@ SUB RedrawPlayerView()
     SetStdHandle(-11, hPlayBuffer)
     SetConsoleActiveScreenBuffer(hPlayBuffer)
 
-    ' Repaint Static HUD
-    DrawStaticHUD()
+    BufClear(C_BLACK)
+    DrawStaticHUDBuf()
 
-    ' Re-render Metadata & Specs (Using Global Buffers)
-    SetConsolePos(13, 2) : SetColor(colArtist) : PRINT g_DispArtist
-    SetConsolePos(13, 3) : SetColor(colTitle)  : PRINT g_DispTitle
-    SetConsolePos(13, 4) : SetColor(colAlbum)  : PRINT g_DispAlbum
+    BufWrite(13, 2, g_DispArtist, colArtist)
+    BufWrite(13, 3, g_DispTitle, colTitle)
+    BufWrite(13, 4, g_DispAlbum, colAlbum)
 
-    SetConsolePos(13, 5) : SetColor(colVol)    : PRINT LEFT$(g_trackYear + SPACE$(21), 21)
-    SetConsolePos(42, 5) : SetColor(colVol)    : PRINT LEFT$(g_trackNum + SPACE$(24), 24)
+    BufWrite(13, 5, LEFT$(g_trackYear + SPACE$(21), 21), colVol)
+    BufWrite(43, 5, LEFT$(g_trackNum + SPACE$(24), 24), colVol)
 
     STRING shufStr
     IF g_Shuffle = 1 THEN shufStr = "ON " ELSE shufStr = "OFF"
-    SetConsolePos(13, 6) : SetColor(colQueue)
-    PRINT "[" + RIGHT$("     " + LTRIM$(STR$(argIdx + 1)), 5) + " / " + RIGHT$("     " + LTRIM$(STR$(g_TrackCount)), 5) + "]" + SPACE$(26) + "SHUFFLE: " + shufStr
+    BufWrite(13, 6, "[" + RIGHT$("     " + LTRIM$(STR$(argIdx + 1)), 5) + " / " + RIGHT$("     " + LTRIM$(STR$(g_TrackCount)), 5) + "]" + SPACE$(26) + "SHUFFLE: " + shufStr, colQueue)
 
-    SetConsolePos(13, 9)  : SetColor(colVol)  : PRINT LEFT$(g_SpecFmt + SPACE$(53), 53)
-    SetConsolePos(13, 10) : SetColor(colTech) : PRINT LEFT$(g_SpecBit + SPACE$(53), 53)
-    SetConsolePos(13, 11) : SetColor(colVol)  : PRINT LEFT$(g_SpecSiz + SPACE$(53), 53)
+    BufWrite(13, 9, LEFT$(g_SpecFmt + SPACE$(53), 53), colVol)
+    BufWrite(12, 10, LEFT$(g_SpecBit + SPACE$(53), 53), colTech)
+    BufWrite(12, 11, LEFT$(g_SpecSiz + SPACE$(53), 53), colVol)
 
-    ' Re-render Comments / Lyrics / Extended HUD
-    RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+    RefreshExtendedDisplayBuf(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
 
-    ' Re-render Cover Art
-    Sleep(50)
-    DrawCoverArt(hStream, g_Playlist[argIdx])
+    ' Flush RAM matrix to active buffer
+    FlushFrameBuffer(g_hConsole)
+
+    ' Render GDI Cover Art
+    RenderCoverArtFast()
 ENDSUB
 
 SUB SwitchToOptionsView()
@@ -1291,9 +1350,174 @@ SUB Trace(STRING msg$)
     OutputDebugStringA("[CPlay Trace] " + msg$ + "\n")
 ENDSUB
 
+' Accurate timer
+SUB SyncFramePacing(POINTER pqpcFrameStart)
+    INT64 qNow = 0q, qTarget = 0q, qDiff = 0q
+    POINTER pDiff = &qDiff
+    INT diff32 = 0, msRemaining = 0
+
+    ' Fallback to standard sleep if QPC is unavailable
+    IF g_ticksPerMs <= 0 THEN
+        Sleep(50)
+        RETURN
+    ENDIF
+
+    qTarget = #<INT64>pqpcFrameStart + g_qpcTargetTicks
+    QueryPerformanceCounter(&qNow)
+
+    ' Protection: If frame render took > 50ms, re-anchor time and yield thread
+    IF qNow >= qTarget THEN
+        #<INT64>pqpcFrameStart = qNow
+        Sleep(1)
+        RETURN
+    ENDIF
+
+    ' Frame synchronization wait loop
+    WHILE qNow < qTarget
+        qDiff = qTarget - qNow
+
+        ' Extract 32-bit tick difference (guaranteed to fit for sub-50ms intervals)
+        diff32 = #<INT>pDiff
+        msRemaining = diff32 / g_ticksPerMs
+
+        IF msRemaining > 2 THEN
+            Sleep(msRemaining - 1)
+        ELSEIF msRemaining > 0 THEN
+            Sleep(1)
+        ELSE
+            ' Yield thread CPU slice for remaining sub-millisecond fraction
+            Sleep(0)
+        ENDIF
+
+        QueryPerformanceCounter(&qNow)
+    WEND
+
+    ' Anchor next frame to exact target timestamp to eliminate drift
+    #<INT64>pqpcFrameStart = qTarget
+ENDSUB
+
 ' ----------------------------------------------------------------------------
 ' UI & Formatting Helpers
 ' ----------------------------------------------------------------------------
+' Clear the in-memory frame buffer instantly with a default color
+SUB BufClear(WORD defaultAttr)
+    INT i
+    FOR i = 0 TO 2159
+        g_FrameBuf[i].BufChar = 32 ' Space character
+        g_FrameBuf[i].Attributes = defaultAttr
+    NEXT i
+ENDSUB
+
+' Write a string into the in-memory matrix at (x, y) with a color attribute
+' Write a string into the in-memory matrix at (x, y) with a color attribute (Zero-Allocation)
+SUB BufWrite(INT x, INT y, STRING txt$, WORD attr)
+    INT i, txtLen = LEN(txt$)
+    INT idx = (y * 80) + x
+    POINTER pTxt = &txt$
+
+    FOR i = 0 TO txtLen - 1
+        IF (x + i) < 80 AND y < 27 THEN
+            g_FrameBuf[idx].BufChar = #<BYTE>pTxt[i]
+            g_FrameBuf[idx].Attributes = attr
+            idx = idx + 1
+        ENDIF
+    NEXT i
+ENDSUB
+
+' Flushes the entire 80x27 memory matrix to video RAM in 1 atomic OS call
+' Full Flush: Used ONLY on track load / view transitions to clear old artwork or text
+SUB FlushFrameBufferFull(HANDLE hConsole)
+    COORD bSize, bCoord
+    SMALL_RECT wRegion
+
+    bSize.X = 80 : bSize.Y = 27
+    bCoord.X = 0  : bCoord.Y = 0
+    wRegion.Left = 0 : wRegion.Top = 0 : wRegion.Right = 79 : wRegion.Bottom = 26
+
+    WriteConsoleOutputA(hConsole, &g_FrameBuf, bSize, bCoord, &wRegion)
+ENDSUB
+
+' Region-Clipped Flush: Used during 20 FPS loop to preserve GDI pixels without flicker
+SUB FlushFrameBuffer(HANDLE hConsole)
+    COORD bSize, bCoord
+    SMALL_RECT wRegion
+
+    bSize.X = 80 : bSize.Y = 27
+
+    ' Region 1: Top HUD & Meters (Rows 0 to 12)
+    bCoord.X = 0 : bCoord.Y = 0
+    wRegion.Left = 0 : wRegion.Top = 0 : wRegion.Right = 79 : wRegion.Bottom = 12
+    WriteConsoleOutputA(hConsole, &g_FrameBuf, bSize, bCoord, &wRegion)
+
+    ' Region 2: Extended Display (Cols 19 to 79, Rows 13 to 23)
+    ' Excludes Cols 0..18 (Rows 13..23) so GDI cover art is NEVER erased!
+    bCoord.X = 19 : bCoord.Y = 13
+    wRegion.Left = 19 : wRegion.Top = 13 : wRegion.Right = 79 : wRegion.Bottom = 23
+    WriteConsoleOutputA(hConsole, &g_FrameBuf, bSize, bCoord, &wRegion)
+
+    ' Region 3: Bottom Hotkey Footer (Rows 24 to 26)
+    bCoord.X = 0 : bCoord.Y = 24
+    wRegion.Left = 0 : wRegion.Top = 24 : wRegion.Right = 79 : wRegion.Bottom = 26
+    WriteConsoleOutputA(hConsole, &g_FrameBuf, bSize, bCoord, &wRegion)
+ENDSUB
+
+' Fast Region 1 Flush: Top HUD & VU Meters (Rows 0 to 12) - 20 FPS
+SUB FlushTopHUD(HANDLE hConsole)
+    ' 1. If minimized, bypass console rendering completely
+    UINT conHwnd = GetConsoleWindow()
+    IF conHwnd <> 0 THEN
+        IF IsIconic(conHwnd) <> 0 THEN RETURN
+    ENDIF
+
+    ' 2. Check if Top HUD buffer changed (1040 cells * 4 bytes per CHAR_INFO = 4160 bytes)
+    DWORD topByteLen = 4160
+    IF API_RtlCompareMemory(&g_FrameBuf, &g_PrevTopBuf, topByteLen) = topByteLen THEN
+        ' Buffer is identical to last frame -> Skip IPC call to conhost.exe!
+        RETURN
+    ENDIF
+
+    ' 3. Perform Console Write
+    COORD bSize, bCoord
+    SMALL_RECT wRegion
+
+    bSize.X = 80 : bSize.Y = 27
+    bCoord.X = 0 : bCoord.Y = 0
+    wRegion.Left = 0 : wRegion.Top = 0 : wRegion.Right = 79 : wRegion.Bottom = 12
+
+    WriteConsoleOutputA(hConsole, &g_FrameBuf, bSize, bCoord, &wRegion)
+
+    ' 4. Update shadow buffer
+    RtlMoveMemory(&g_PrevTopBuf, &g_FrameBuf, topByteLen)
+ENDSUB
+
+' Fast Region 2 Flush: Extended Display (Cols 19 to 79, Rows 13 to 23) - Flushed on change
+SUB FlushExtendedRegion(HANDLE hConsole)
+    ' 1. Bypass console write if window is minimized
+    UINT conHwnd = GetConsoleWindow()
+    IF conHwnd <> 0 THEN
+        IF IsIconic(conHwnd) <> 0 THEN RETURN
+    ENDIF
+
+    ' 2. Skip write if Region 2 buffer (Rows 13 to 23 = 880 cells * 4 bytes = 3520 bytes) hasn't changed
+    DWORD extByteLen = 3520
+    IF API_RtlCompareMemory(&g_FrameBuf[1040], &g_PrevExtBuf, extByteLen) = extByteLen THEN
+        RETURN
+    ENDIF
+
+    ' 3. Perform Console Write (Cols 19..79, Rows 13..23)
+    COORD bSize, bCoord
+    SMALL_RECT wRegion
+
+    bSize.X = 80 : bSize.Y = 27
+    bCoord.X = 19 : bCoord.Y = 13
+    wRegion.Left = 19 : wRegion.Top = 13 : wRegion.Right = 79 : wRegion.Bottom = 23
+
+    WriteConsoleOutputA(hConsole, &g_FrameBuf, bSize, bCoord, &wRegion)
+
+    ' 4. Update shadow buffer cache
+    RtlMoveMemory(&g_PrevExtBuf, &g_FrameBuf[1040], extByteLen)
+ENDSUB
+
 SUB SetConsolePos(INT x, INT y)
     COORD pos
     pos.X = x : pos.Y = y
@@ -1302,14 +1526,6 @@ ENDSUB
 
 SUB SetColor(INT colorAttr)
     SetConsoleTextAttribute(g_hConsole, colorAttr)
-ENDSUB
-
-SUB ConsoleWrite(INT x, INT y, STRING txt$)
-    COORD pos
-    pos.X = x : pos.Y = y
-    SetConsoleCursorPosition(g_hConsole, pos)
-    DWORD written = 0
-    WriteConsoleA(g_hConsole, txt$, LEN(txt$), &written, 0)
 ENDSUB
 
 SUB FormatTimeStr(DOUBLE totalSeconds), STRING
@@ -1598,123 +1814,10 @@ SUB SetTheme()
             colStatusPause= C_DARK_GRAY
             colProg   = C_LIGHT_GRAY : colVU = C_WHITE : colTech = C_LIGHT_GRAY
     ENDSELECT
-    DrawStaticHUD()
+    DrawStaticHUDBuf()
 ENDSUB
 
-SUB DrawCoverArt(DWORD hStream, STRING trackPath)
-    STRING dirPath, fileName, imgPath = ""
-    FILE hF
-    
-    IF SplitTwo(trackPath, "\\", dirPath, fileName, 0, 1) = 1 THEN
-        dirPath = dirPath + "\\"
-    ELSE
-        dirPath = ""
-    ENDIF
-    
-    STRING testPath = dirPath + "cover.jpg"
-    IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF
-    IF imgPath = "" THEN : testPath = dirPath + "cover.png"  : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
-    IF imgPath = "" THEN : testPath = dirPath + "folder.jpg" : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
-    IF imgPath = "" THEN : testPath = dirPath + "folder.png" : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
-    IF imgPath = "" THEN : testPath = dirPath + "front.jpg"  : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
-    IF imgPath = "" THEN : testPath = dirPath + "front.png"  : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
-    
-    IF imgPath = "" THEN
-        POINTER pID3 = BASS_ChannelGetTags(hStream, BASS_TAG_ID3V2)
-        IF pID3 <> 0 THEN
-            INT b1 = *<BYTE>(pID3 + 6) & 0x7F, b2 = *<BYTE>(pID3 + 7) & 0x7F
-            INT b3 = *<BYTE>(pID3 + 8) & 0x7F, b4 = *<BYTE>(pID3 + 9) & 0x7F
-            INT tagSize = (b1 << 21) | (b2 << 14) | (b3 << 7) | b4
-            INT i, imgSize = 0
-            STRING tmpImg = ""
-            
-            FOR i = 10 TO tagSize - 4
-                IF *<BYTE>(pID3 + i) = 0xFF AND *<BYTE>(pID3 + i + 1) = 0xD8 AND *<BYTE>(pID3 + i + 2) = 0xFF THEN
-                    imgSize = tagSize - i
-                    tmpImg = GETSTARTPATH() + "cplay_tmp.jpg"
-                ELSEIF *<BYTE>(pID3 + i) = 0x89 AND *<BYTE>(pID3 + i + 1) = 0x50 AND *<BYTE>(pID3 + i + 2) = 0x4E AND *<BYTE>(pID3 + i + 3) = 0x47 THEN
-                    imgSize = tagSize - i
-                    tmpImg = GETSTARTPATH() + "cplay_tmp.png"
-                ENDIF
-                
-                IF tmpImg <> "" THEN
-                    UINT hFile = CreateFileA(tmpImg, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0)
-                    IF hFile <> -1 AND hFile <> 0 THEN
-                        DWORD bytesWritten = 0
-                        WriteFile(hFile, pID3 + i, imgSize, &bytesWritten, 0)
-                        CloseHandle(hFile)
-                        imgPath = tmpImg
-                    ENDIF
-                    i = tagSize
-                ENDIF
-            NEXT i
-        ENDIF
-    ENDIF
-
-    IF imgPath = "" THEN
-        POINTER pPic = BASS_ChannelGetTags(hStream, BASS_TAG_FLAC_PICTURE)
-        IF pPic <> 0 THEN
-            DWORD flacImgSize = *<DWORD>(pPic + 28)
-            POINTER pData = *<POINTER>(pPic + 32)
-            
-            IF pData <> 0 AND flacImgSize > 0 THEN
-                STRING tmpFlacImg = ""
-                IF *<BYTE>(pData) = 0xFF AND *<BYTE>(pData + 1) = 0xD8 AND *<BYTE>(pData + 2) = 0xFF THEN
-                    tmpFlacImg = GETSTARTPATH() + "cplay_tmp.jpg"
-                ELSEIF *<BYTE>(pData) = 0x89 AND *<BYTE>(pData + 1) = 0x50 AND *<BYTE>(pData + 2) = 0x4E AND *<BYTE>(pData + 3) = 0x47 THEN
-                    tmpFlacImg = GETSTARTPATH() + "cplay_tmp.png"
-                ENDIF
-                
-                IF tmpFlacImg <> "" THEN
-                    UINT hFileFlac = CreateFileA(tmpFlacImg, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0)
-                    IF hFileFlac <> -1 AND hFileFlac <> 0 THEN
-                        DWORD bytesWrittenFlac = 0
-                        WriteFile(hFileFlac, pData, flacImgSize, &bytesWrittenFlac, 0)
-                        CloseHandle(hFileFlac)
-                        imgPath = tmpFlacImg
-                    ENDIF
-                ENDIF
-            ENDIF
-        ENDIF
-    ENDIF
-    
-    IF imgPath = "" THEN RETURN
-    
-    POINTER pWidePath = GetWideString(imgPath)
-    POINTER pImage = 0
-    GdipLoadImageFromFile(pWidePath, &pImage)
-    DELETE pWidePath
-    
-    IF pImage = 0 THEN RETURN 
-    
-    UINT hBmp = 0
-    GdipCreateHBITMAPFromBitmap(pImage, &hBmp, 0)
-    GdipDisposeImage(pImage) 
-    
-    IF hBmp = 0 THEN RETURN
-    
-    UINT hWnd = GetConsoleWindow()
-    UINT hDC = GetDC(hWnd)
-    UINT hMemDC = CreateCompatibleDC(hDC)
-    UINT hOldBmp = SelectObject(hMemDC, hBmp)
-    
-    WINRECT crect
-    GetClientRect(hWnd, &crect)
-    BITMAP bm
-    GetObjectA(hBmp, LEN(bm), &bm)
-    
-    INT targetW = 145, targetH = 145
-    INT posX = crect.left + 5, posY = crect.bottom - targetH - 23
-    
-    StretchBlt(hDC, posX, posY, targetW, targetH, hMemDC, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY)
-    
-    SelectObject(hMemDC, hOldBmp)
-    DeleteDC(hMemDC)
-    ReleaseDC(hWnd, hDC)
-    DeleteObject(hBmp)
-ENDSUB
-
-SUB DrawProgressBar(DOUBLE currentS, DOUBLE totalS, INT barWidth)
+SUB DrawProgressBarBuf(DOUBLE currentS, DOUBLE totalS, INT startX, INT startY, INT barWidth)
     INT filled = 0, percentage = 0, i
     STRING barStr = ""
     IF totalS > 0 THEN
@@ -1727,37 +1830,51 @@ SUB DrawProgressBar(DOUBLE currentS, DOUBLE totalS, INT barWidth)
     FOR i = 1 TO barWidth
         IF i <= filled THEN barStr = barStr + CHR$(178) ELSE barStr = barStr + CHR$(176)
     NEXT i
-    PRINT barStr + " " + RIGHT$("  " + STR$(percentage), 3) + "%  "
+
+    STRING fullBar = barStr + " " + RIGHT$("  " + STR$(percentage), 3) + "%  "
+    BufWrite(startX, startY, fullBar, colProg)
 ENDSUB
 
-SUB DrawVerticalMeter(INT lLevel, INT rLevel, INT startX, INT startY, INT meterHeight)
+SUB DrawVerticalMeterBuf(INT lLevel, INT rLevel, INT startX, INT startY, INT meterHeight)
     INT lFilled = INT((lLevel / 31000.0) * meterHeight)
     INT rFilled = INT((rLevel / 31000.0) * meterHeight)
     
     IF lFilled > meterHeight THEN lFilled = meterHeight
     IF rFilled > meterHeight THEN rFilled = meterHeight
 
-    INT row, idx, fillLevel
-    STRING lChar, rChar
+    INT idx, fillLevel, charVal, attrVal
+    ' STRING meterPair
 
     FOR idx = 0 TO meterHeight - 1
-        row = startY + idx
         fillLevel = meterHeight - idx
 
+        ' Dynamic VU Segment Color
         IF fillLevel >= 9 THEN
-            SetColor(C_RED)
+            attrVal = C_RED
         ELSEIF fillLevel >= 7 THEN
-            SetColor(C_YELLOW)
+            attrVal = C_YELLOW
         ELSE
-            SetColor(C_GREEN)
+            attrVal = C_GREEN
         ENDIF
 
-        IF lFilled >= fillLevel THEN lChar = CHR$(178) ELSE lChar = CHR$(176)
-        IF rFilled >= fillLevel THEN rChar = CHR$(178) ELSE rChar = CHR$(176)
+        ' Left Channel Column
+        IF lFilled >= fillLevel THEN charVal = 178 ELSE charVal = 176
+        g_FrameBuf[((startY + idx) * 80) + startX].BufChar       = charVal
+        g_FrameBuf[((startY + idx) * 80) + startX].Attributes = attrVal
+        g_FrameBuf[((startY + idx) * 80) + startX + 1].BufChar       = charVal
+        g_FrameBuf[((startY + idx) * 80) + startX + 1].Attributes = attrVal
 
-        ConsoleWrite(startX, row, lChar + lChar + " " + rChar + rChar)
+        ' Gap
+        g_FrameBuf[((startY + idx) * 80) + startX + 2].BufChar       = 32
+        g_FrameBuf[((startY + idx) * 80) + startX + 2].Attributes = colStatic
+
+        ' Right Channel Column
+        IF rFilled >= fillLevel THEN charVal = 178 ELSE charVal = 176
+        g_FrameBuf[((startY + idx) * 80) + startX + 3].BufChar       = charVal
+        g_FrameBuf[((startY + idx) * 80) + startX + 3].Attributes = attrVal
+        g_FrameBuf[((startY + idx) * 80) + startX + 4].BufChar       = charVal
+        g_FrameBuf[((startY + idx) * 80) + startX + 4].Attributes = attrVal
     NEXT idx
-    SetColor(colStatic)
 ENDSUB
 
 SUB SwitchToPlaylistView()
@@ -1786,17 +1903,19 @@ SUB SwitchToPlaylistView()
         g_PlaylistScrollOffset = g_PlaylistSelectIdx - 9
         IF g_PlaylistScrollOffset < 0 THEN g_PlaylistScrollOffset = 0
 
+        ' Initialize marquee buffer for currently focused track
+        InitPlMarqueeRing()
+
         DrawPlaylistScreen()
     ENDIF
 ENDSUB
 
 SUB DrawPlaylistScreen()
-    ' Local Variable Declarations
     INT visibleCount = 19
-    INT i, realIdx, rowY, isPlSelected, mPos
-    STRING trackName, trackLine, numPrefix, playingTag, dispName, padName, headerStr
+    INT i, realIdx, rowY, isPlSelected
+    STRING trackName, trackLine, numPrefix, playingTag, dispName, headerStr
 
-    ' 1. Top Header Banner (Theme Tech Color) - Row 0
+    ' 1. Top Header Banner - Row 0
     SetColor(colTech + (colStatic * 16))
     SetConsolePos(0, 0)
     headerStr = "--[ BROWSE PLAYLIST (" + LTRIM$(STR$(g_FilteredCount)) + " / " + LTRIM$(STR$(g_TrackCount)) + " Tracks) ]"
@@ -1814,20 +1933,18 @@ SUB DrawPlaylistScreen()
 
         IF (g_PlaylistScrollOffset + i) < g_FilteredCount THEN
             realIdx = g_FilteredIndices[g_PlaylistScrollOffset + i]
-            trackName = ConvertANSItoOEM(EnsureANSI(GetFileNameOnly(g_Playlist[realIdx])))
             numPrefix = RIGHT$("     " + LTRIM$(STR$(realIdx + 1)), 5) + ". "
 
             IF realIdx = argIdx THEN playingTag = " [PLAYING]" ELSE playingTag = ""
 
             isPlSelected = ((g_PlaylistScrollOffset + i) = g_PlaylistSelectIdx)
 
-            ' Scrolling Marquee Logic for Focused Selection
-            IF isPlSelected = 1 AND LEN(trackName) > 59 THEN
-                padName = trackName + " || "
-                mPos = (plMarqueeOffset % LEN(padName)) + 1
-                dispName = LEFT$(MID$(padName, mPos, LEN(padName)) + padName, 59)
+            IF isPlSelected = 1 THEN
+                GetMarqueeSlice(&g_PlMarqueeRing, g_PlMarqueePeriod, plMarqueeOffset, 59, &g_PlMarqueeDisp)
+                dispName = g_PlMarqueeDisp
             ELSE
-                dispName = LEFT$(trackName + SPACE$(59), 59)
+                trackName = ConvertANSItoOEM(EnsureANSI(GetFileNameOnly(g_Playlist[realIdx])))
+                dispName  = LEFT$(trackName + SPACE$(59), 59)
             ENDIF
 
             trackLine = " " + numPrefix + dispName + playingTag
@@ -1836,16 +1953,16 @@ SUB DrawPlaylistScreen()
             ' Dynamic Theme Coloring Logic
             IF isPlSelected = 1 THEN
                 IF realIdx = argIdx THEN
-                    SetColor(C_BLACK + (colStatusPlay * 16)) ' Selected & Playing
+                    SetColor(C_BLACK + (colStatusPlay * 16))
                 ELSE
-                    SetColor(C_BLACK + (colArtist * 16))     ' Selected Cursor
+                    SetColor(C_BLACK + (colArtist * 16))
                 ENDIF
                 trackLine = ">" + RIGHT$(trackLine, 77)
             ELSE
                 IF realIdx = argIdx THEN
-                    SetColor(colStatusPlay)                  ' Unfocused Playing Track
+                    SetColor(colStatusPlay)
                 ELSE
-                    SetColor(colVol)                         ' Standard Playlist Track
+                    SetColor(colVol)
                 ENDIF
             ENDIF
 
@@ -1888,63 +2005,56 @@ SUB DrawPlaylistScreen()
     ELSE
         PRINT LEFT$(" [S]earch | [Enter] Play & Resume Queue | [P]lay All Filtered | [Esc] Back" + SPACE$(80), 80)
     ENDIF
-    SetColor(colStatic)
+    SetColor(C_LIGHT_GRAY)
 ENDSUB
 
-SUB FilterPlaylist()
-    INT i
-    g_FilteredCount = 0
-    STRING searchLower = LCASE$(g_SearchBuf)
-    
-    plMarqueeOffset = 0
-    plMarqueeTick = 0
+SUB DrawStaticHUDBuf()
+    BufWrite(0, 0, " [SPACE] Pause | [P]rev | [N]ext | [S]huffle | [Up/Dn] Vol | [B]rowse playlist  ", colVol + (colStatic * 16))
+    BufWrite(1, 2, " ARTIST   :", colStatic)
+    BufWrite(1, 3, " TITLE    :", colStatic)
+    BufWrite(1, 4, " ALBUM    :", colStatic)
+    BufWrite(1, 5, " YEAR     :", colStatic)
+    BufWrite(34, 5, " TRACK : ", colStatic)
+    BufWrite(1, 6, " QUEUE    :", colStatic)
+    BufWrite(1, 7, " STATUS   :", colStatic)
+    BufWrite(1, 8, " PROGRESS :", colStatic)
+    BufWrite(1, 9, " FORMAT   :", colStatic)
+    BufWrite(1, 10, " BITRATE  :", colStatic)
+    BufWrite(1, 11, " SIZE     :", colStatic)
+    BufWrite(19, 24, "[T]hemes | [C]omments | [L]yrics | [O]ptions | [Q]uit" + SPACE$(8), colVol + (colStatic * 16))
+ENDSUB
 
-    IF searchLower = "" THEN
-        FOR i = 0 TO g_TrackCount - 1
-            g_FilteredIndices[i] = i
-        NEXT i
-        g_FilteredCount = g_TrackCount
+SUB DrawStatusLineBuf(INT isPlaying, DOUBLE currentSecs, DOUBLE totalSecs, INT volLevel)
+    STRING volStr = "VOL: " + RIGHT$("  " + LTRIM$(STR$(volLevel)), 3) + "%"
+    STRING timeStr = FormatTimeStr(currentSecs) + " / " + FormatTimeStr(totalSecs)
+    STRING statusTag
+    WORD tagAttr, infoAttr
+
+    IF isPlaying = 1 THEN
+        statusTag = "[PLAYING]"
+        tagAttr   = colStatusPlay
+        infoAttr  = colVol
     ELSE
-        FOR i = 0 TO g_TrackCount - 1
-            IF INSTR(LCASE$(g_Playlist[i]), searchLower) > 0 THEN
-                g_FilteredIndices[g_FilteredCount] = i
-                g_FilteredCount = g_FilteredCount + 1
-            ENDIF
-        NEXT i
+        statusTag = "[PAUSED] "
+        tagAttr   = colStatusPause
+        infoAttr  = colStatusPause
     ENDIF
 
-    ' Clamp selection index within new filtered bounds
-    IF g_PlaylistSelectIdx >= g_FilteredCount THEN
-        g_PlaylistSelectIdx = g_FilteredCount - 1
-    ENDIF
-    IF g_PlaylistSelectIdx < 0 THEN g_PlaylistSelectIdx = 0
+    ' 1. Clear the 53-character status field
+    BufWrite(13, 7, SPACE$(53), colStatic)
 
-    ' Clamp scroll position
-    IF g_PlaylistScrollOffset > g_PlaylistSelectIdx THEN
-        g_PlaylistScrollOffset = g_PlaylistSelectIdx
-    ENDIF
-ENDSUB
+    ' 2. Calculate column positions
+    INT spacesNeeded = (53 - LEN(statusTag) - LEN(timeStr) - LEN(volStr)) / 2
+    IF spacesNeeded < 1 THEN spacesNeeded = 1
 
-SUB DrawStaticHUD()
-    CLS
-    SetColor(colVol + (colStatic * 16))
-    SetConsolePos(0, 0) : PRINT " [SPACE] Pause | [P]rev | [N]ext | [S]huffle | [Up/Dn] Vol | [B]rowse playlist  "
-    SetColor(colStatic)
-    SetConsolePos(1, 2) : PRINT " ARTIST   :"
-    SetConsolePos(1, 3) : PRINT " TITLE    :"
-    SetConsolePos(1, 4) : PRINT " ALBUM    :"
-    SetConsolePos(1, 5) : PRINT " YEAR     :"
-    SetConsolePos(34, 5): PRINT " TRACK : "
-    SetConsolePos(1, 6) : PRINT " QUEUE    :"
-    SetConsolePos(1, 7) : PRINT " STATUS   :"
-    SetConsolePos(1, 8) : PRINT " PROGRESS :"
-    SetConsolePos(1, 9) : PRINT " FORMAT   :"
-    SetConsolePos(1, 10): PRINT " BITRATE  :"
-    SetConsolePos(1, 11): PRINT " SIZE     :"
+    INT statusX = 13
+    INT volX    = statusX + LEN(statusTag) + spacesNeeded
+    INT timeX   = volX + LEN(volStr) + spacesNeeded
 
-    SetColor(colVol + (colStatic * 16))
-    SetConsolePos(19, 24) : PRINT "[T]hemes | [C]omments | [L]yrics | [O]ptions | [Q]uit" + SPACE$(7)
-    SetColor(colStatic)
+    ' 3. Render tag and status values with state-driven colors
+    BufWrite(statusX, 7, statusTag, tagAttr)
+    BufWrite(volX,    7, volStr,    infoAttr)
+    BufWrite(timeX,   7, timeStr,   infoAttr)
 ENDSUB
 
 SUB DrawStatusLine(INT isPlaying, DOUBLE currentSecs, DOUBLE totalSecs, INT volLevel)
@@ -2920,6 +3030,10 @@ ENDSUB
 SUB LoadTrackMetadata(DWORD hStream, INT argIdx)
     IF hStream = 0 THEN RETURN
 
+    ' 1. Pre-load GDI cover art cache
+    LoadCoverArtCache(hStream, g_Playlist[argIdx])
+
+    ' 2. Channel Length & Info
     totalLenBytes = BASS_ChannelGetLength(hStream)
     BASS_ChannelGetInfo(hStream, &g_chanInfo)
 
@@ -2929,6 +3043,7 @@ SUB LoadTrackMetadata(DWORD hStream, INT argIdx)
         totalSecs = 0.0
     ENDIF
 
+    ' 3. Tag Extraction
     STRING trackArtist, trackTitle, trackAlbum
 
     trackArtist = GetVorbisComment(hStream, "ARTIST")
@@ -2962,6 +3077,7 @@ SUB LoadTrackMetadata(DWORD hStream, INT argIdx)
 
     g_ExtScroll = 0
     
+    ' 4. Comments & Lyrics
     g_pComments[0] = 0
     GetVorbisCommentLongPtr(hStream, "COMMENT", g_pComments, 8192)
     IF g_pComments[0] = 0 THEN GetVorbisCommentLongPtr(hStream, "DESCRIPTION", g_pComments, 8192)
@@ -2993,23 +3109,12 @@ SUB LoadTrackMetadata(DWORD hStream, INT argIdx)
     g_CommentPage = 0
     g_CommentTick = 0
 
-    ' Store into global variables for marquee and UI access
     g_TrackArtist = trackArtist
     g_TrackTitle  = trackTitle
     g_TrackAlbum  = trackAlbum
 
-    ' Marquee Padding Strings
-    IF LEN(g_TrackArtist) > 53 THEN g_PadArtist = g_TrackArtist + " || " ELSE g_PadArtist = g_TrackArtist
-    IF LEN(g_TrackTitle)  > 53 THEN g_PadTitle  = g_TrackTitle  + " || " ELSE g_PadTitle  = g_TrackTitle
-    IF LEN(g_TrackAlbum)  > 53 THEN g_PadAlbum  = g_TrackAlbum  + " || " ELSE g_PadAlbum  = g_TrackAlbum
-
-    ' Initial Display Crop
-    IF LEN(g_TrackArtist) > 53 THEN g_DispArtist = LEFT$(g_PadArtist, 53) ELSE g_DispArtist = LEFT$(g_PadArtist + SPACE$(53), 53)
-    IF LEN(g_TrackTitle)  > 53 THEN g_DispTitle  = LEFT$(g_PadTitle, 53)  ELSE g_DispTitle  = LEFT$(g_PadTitle  + SPACE$(53), 53)
-    IF LEN(g_TrackAlbum)  > 53 THEN g_DispAlbum  = LEFT$(g_PadAlbum, 53)  ELSE g_DispAlbum  = LEFT$(g_PadAlbum  + SPACE$(53), 53)
-
-    ' Codec & Channel Format Specs
-    STRING codecStr, chanStr
+    ' 5. Codec & Frequency Formatting (Pure INT Math - Prevents Stack Bug)
+    STRING codecStr, chanStr, freqStr
     SELECT g_chanInfo.ctype
         CASE BASS_CTYPE_STREAM_FLAC : codecStr = "FLAC"
         CASE BASS_CTYPE_STREAM_MP3  : codecStr = "MP3"
@@ -3017,30 +3122,84 @@ SUB LoadTrackMetadata(DWORD hStream, INT argIdx)
     ENDSELECT
     
     IF g_chanInfo.chans = 2 THEN chanStr = "Stereo" ELSE chanStr = "Mono"
-    g_specFmt = codecStr + " / " + LTRIM$(STR$(g_chanInfo.freq / 1000.0)) + " kHz / " + chanStr
 
-    ' Bitrate & File Size Specs
-    DOUBLE fileSizeMB, dBytes
-    QWORD fileSizeBytes
+    IF g_chanInfo.freq > 0 THEN
+        INT khzWhole = g_chanInfo.freq / 1000
+        INT khzFrac  = (g_chanInfo.freq % 1000) / 100
+        freqStr = STR$(khzWhole) + "." + STR$(khzFrac) + " kHz"
+    ELSE
+        freqStr = "--.- kHz"
+    ENDIF
+
+    g_specFmt = codecStr + " / " + freqStr + " / " + chanStr
+
+    ' 6. Disk File Size & Compressed Bitrate (Pure INT Math - Prevents Stack Bug)
+    DWORD fileBytes = BASS_StreamGetFilePosition(hStream, BASS_FILEPOS_END)
     INT bitrate = 0
 
-    fileSizeBytes = BASS_StreamGetFilePosition(hStream, BASS_FILEPOS_END)
-    IF fileSizeBytes > 0q AND fileSizeBytes < 10000000000q THEN
-        dBytes = fileSizeBytes : fileSizeMB = dBytes / 1048576.0
-        IF totalSecs > 0.0 THEN bitrate = INT((dBytes * 8.0) / (totalSecs * 1000.0))
+    IF fileBytes > 0 AND totalSecs > 0.0 THEN
+        DOUBLE dFileBytes = fileBytes
+        bitrate = INT((dFileBytes * 8.0) / (totalSecs * 1000.0))
+    ENDIF
+
+    IF bitrate > 0 THEN 
+        g_specBit = STR$(bitrate) + " kbps" 
+    ELSE 
+        g_specBit = "Unknown"
+    ENDIF
+
+    IF fileBytes > 0 THEN
+      INT mbWhole = fileBytes / 1048576
+      INT mbRem   = fileBytes % 1048576
+      INT mbFrac  = (mbRem * 100) / 1048576
+
+      STRING szFrac = LTRIM$(STR$(mbFrac))
+      IF mbFrac < 10 THEN szFrac = "0" + szFrac
+
+      g_specSiz = " " + LTRIM$(STR$(mbWhole)) + "." + szFrac + " MB"
     ELSE
-        fileSizeMB = 0.0
+      g_specSiz = "Unknown"
     ENDIF
 
-    IF bitrate > 0 THEN g_specBit = LTRIM$(STR$(bitrate)) + " kbps" ELSE g_specBit = "Unknown"
-
-    g_specSiz = "Unknown"
-    IF fileSizeMB > 0.0 THEN
-        STRING sizeTmp = LTRIM$(STR$(fileSizeMB))
-        INT dPos = INSTR(sizeTmp, ".")
-        IF dPos > 0 THEN sizeTmp = LEFT$(sizeTmp, dPos + 2)
-        g_specSiz = sizeTmp + " MB"
+    ' 7. Build Doubled Ring Buffers for Marquees
+    IF LEN(g_TrackArtist) > 53 THEN
+        g_PadArtist    = g_TrackArtist + " || "
+        g_RingArtist   = g_PadArtist + g_PadArtist
+        g_PeriodArtist = LEN(g_PadArtist)
+    ELSE
+        g_RingArtist   = LEFT$(g_TrackArtist + SPACE$(53), 53)
+        g_PeriodArtist = 0
     ENDIF
+
+    IF LEN(g_TrackTitle) > 53 THEN
+        g_PadTitle    = g_TrackTitle + " || "
+        g_RingTitle   = g_PadTitle + g_PadTitle
+        g_PeriodTitle = LEN(g_PadTitle)
+    ELSE
+        g_RingTitle   = LEFT$(g_TrackTitle + SPACE$(53), 53)
+        g_PeriodTitle = 0
+    ENDIF
+
+    IF LEN(g_TrackAlbum) > 53 THEN
+        g_PadAlbum    = g_TrackAlbum + " || "
+        g_RingAlbum   = g_PadAlbum + g_PadAlbum
+        g_PeriodAlbum = LEN(g_PadAlbum)
+    ELSE
+        g_RingAlbum   = LEFT$(g_TrackAlbum + SPACE$(53), 53)
+        g_PeriodAlbum = 0
+    ENDIF
+
+    GetMarqueeSlice(&g_RingArtist, g_PeriodArtist, 0, 53, &g_DispArtistBuf)
+    GetMarqueeSlice(&g_RingTitle,  g_PeriodTitle,  0, 53, &g_DispTitleBuf)
+    GetMarqueeSlice(&g_RingAlbum,  g_PeriodAlbum,  0, 53, &g_DispAlbumBuf)
+
+    g_DispArtist = g_DispArtistBuf
+    g_DispTitle  = g_DispTitleBuf
+    g_DispAlbum  = g_DispAlbumBuf
+
+    ' 9. Clear shadow buffers so FlushTopHUD & FlushExtendedRegion force a conhost redraw
+    RtlZeroMemory(&g_PrevTopBuf, 4160)
+    RtlZeroMemory(&g_PrevExtBuf, 3520)
 ENDSUB
 
 SUB TruncatePathSmart(STRING fullPath, INT maxLen), STRING
@@ -3099,22 +3258,218 @@ SUB TruncatePathSmart(STRING fullPath, INT maxLen), STRING
     RETURN prefixStr + tailStr
 ENDSUB
 
-SUB DrawExtendedMetadataHUD()
-    ' Convert path to OEM codepage and apply smart middle truncation (106 char max budget)
+SUB InitPlMarqueeRing()
+    IF g_FilteredCount > 0 AND g_PlaylistSelectIdx >= 0 AND g_PlaylistSelectIdx < g_FilteredCount THEN
+        INT realIdx = g_FilteredIndices[g_PlaylistSelectIdx]
+        STRING trackName = ConvertANSItoOEM(EnsureANSI(GetFileNameOnly(g_Playlist[realIdx])))
+        IF LEN(trackName) > 59 THEN
+            STRING padName    = trackName + " || "
+            g_PlMarqueeRing   = padName + padName
+            g_PlMarqueePeriod = LEN(padName)
+        ELSE
+            g_PlMarqueeRing   = LEFT$(trackName + SPACE$(59), 59)
+            g_PlMarqueePeriod = 0
+        ENDIF
+    ELSE
+        g_PlMarqueeRing   = SPACE$(59)
+        g_PlMarqueePeriod = 0
+    ENDIF
+ENDSUB
+
+SUB FilterPlaylist()
+    INT i
+    g_FilteredCount = 0
+    STRING searchLower = LCASE$(g_SearchBuf)
+    
+    plMarqueeOffset = 0
+    plMarqueeTick = 0
+
+    IF searchLower = "" THEN
+        FOR i = 0 TO g_TrackCount - 1
+            g_FilteredIndices[i] = i
+        NEXT i
+        g_FilteredCount = g_TrackCount
+    ELSE
+        FOR i = 0 TO g_TrackCount - 1
+            IF INSTR(LCASE$(g_Playlist[i]), searchLower) > 0 THEN
+                g_FilteredIndices[g_FilteredCount] = i
+                g_FilteredCount = g_FilteredCount + 1
+            ENDIF
+        NEXT i
+    ENDIF
+
+    ' Clamp selection index within new filtered bounds
+    IF g_PlaylistSelectIdx >= g_FilteredCount THEN
+        g_PlaylistSelectIdx = g_FilteredCount - 1
+    ENDIF
+    IF g_PlaylistSelectIdx < 0 THEN g_PlaylistSelectIdx = 0
+
+    ' Clamp scroll position
+    IF g_PlaylistScrollOffset > g_PlaylistSelectIdx THEN
+        g_PlaylistScrollOffset = g_PlaylistSelectIdx
+    ENDIF
+
+    ' Re-initialize marquee ring buffer for newly focused row
+    InitPlMarqueeRing()
+ENDSUB
+
+SUB FreeCoverArtCache()
+    IF g_hCoverDC <> 0 THEN
+        IF g_hOldBmp <> 0 THEN SelectObject(g_hCoverDC, g_hOldBmp)
+        DeleteDC(g_hCoverDC)
+        g_hCoverDC = 0
+        g_hOldBmp  = 0
+    ENDIF
+
+    IF g_hCoverBmp <> 0 THEN
+        DeleteObject(g_hCoverBmp)
+        g_hCoverBmp = 0
+    ENDIF
+
+    g_CoverW = 0 : g_CoverH = 0
+ENDSUB
+
+SUB LoadCoverArtCache(DWORD hStream, STRING trackPath)
+    FreeCoverArtCache()
+
+    STRING dirPath, fileName, imgPath = ""
+    FILE hF
+    
+    IF SplitTwo(trackPath, "\\", dirPath, fileName, 0, 1) = 1 THEN
+        dirPath = dirPath + "\\"
+    ELSE
+        dirPath = ""
+    ENDIF
+    
+    STRING testPath = dirPath + "cover.jpg"
+    IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF
+    IF imgPath = "" THEN : testPath = dirPath + "cover.png"  : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
+    IF imgPath = "" THEN : testPath = dirPath + "folder.jpg" : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
+    IF imgPath = "" THEN : testPath = dirPath + "folder.png" : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
+    IF imgPath = "" THEN : testPath = dirPath + "front.jpg"  : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
+    IF imgPath = "" THEN : testPath = dirPath + "front.png"  : IF OPENFILE(hF, testPath, "R") = 0 THEN : CLOSEFILE(hF) : imgPath = testPath : ENDIF : ENDIF
+    
+    ' ID3v2 APIC Tag Extraction
+    IF imgPath = "" THEN
+        POINTER pID3 = BASS_ChannelGetTags(hStream, BASS_TAG_ID3V2)
+        IF pID3 <> 0 THEN
+            INT b1 = *<BYTE>(pID3 + 6) & 0x7F, b2 = *<BYTE>(pID3 + 7) & 0x7F
+            INT b3 = *<BYTE>(pID3 + 8) & 0x7F, b4 = *<BYTE>(pID3 + 9) & 0x7F
+            INT tagSize = (b1 << 21) | (b2 << 14) | (b3 << 7) | b4
+            INT i, imgSize = 0
+            STRING tmpImg = ""
+            
+            FOR i = 10 TO tagSize - 4
+                IF *<BYTE>(pID3 + i) = 0xFF AND *<BYTE>(pID3 + i + 1) = 0xD8 AND *<BYTE>(pID3 + i + 2) = 0xFF THEN
+                    imgSize = tagSize - i : tmpImg = GETSTARTPATH() + "cplay_tmp.jpg"
+                ELSEIF *<BYTE>(pID3 + i) = 0x89 AND *<BYTE>(pID3 + i + 1) = 0x50 AND *<BYTE>(pID3 + i + 2) = 0x4E AND *<BYTE>(pID3 + i + 3) = 0x47 THEN
+                    imgSize = tagSize - i : tmpImg = GETSTARTPATH() + "cplay_tmp.png"
+                ENDIF
+                
+                IF tmpImg <> "" THEN
+                    UINT hFile = CreateFileA(tmpImg, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0)
+                    IF hFile <> -1 AND hFile <> 0 THEN
+                        DWORD bytesWritten = 0
+                        WriteFile(hFile, pID3 + i, imgSize, &bytesWritten, 0)
+                        CloseHandle(hFile)
+                        imgPath = tmpImg
+                    ENDIF
+                    i = tagSize
+                ENDIF
+            NEXT i
+        ENDIF
+    ENDIF
+
+    IF imgPath = "" THEN RETURN
+    
+    POINTER pWidePath = GetWideString(imgPath)
+    POINTER pImage = 0
+    GdipLoadImageFromFile(pWidePath, &pImage)
+    DELETE pWidePath
+    
+    IF pImage = 0 THEN RETURN 
+    
+    GdipCreateHBITMAPFromBitmap(pImage, &g_hCoverBmp, 0)
+    GdipDisposeImage(pImage) 
+    
+    IF g_hCoverBmp <> 0 THEN
+        BITMAP bm
+        GetObjectA(g_hCoverBmp, LEN(bm), &bm)
+        g_CoverW = bm.bmWidth
+        g_CoverH = bm.bmHeight
+
+        ' Create memory DC once and keep bitmap pre-selected
+        UINT hWnd = GetConsoleWindow()
+        UINT hDC = GetDC(hWnd)
+        g_hCoverDC = CreateCompatibleDC(hDC)
+        g_hOldBmp  = SelectObject(g_hCoverDC, g_hCoverBmp)
+        ReleaseDC(hWnd, hDC)
+    ENDIF
+ENDSUB
+
+SUB RenderCoverArtFast()
+    IF g_hCoverDC = 0 OR g_hCoverBmp = 0 THEN RETURN
+
+    UINT hWnd = GetConsoleWindow()
+    IF hWnd = 0 THEN RETURN
+
+    UINT hDC = GetDC(hWnd)
+    IF hDC <> 0 THEN
+        WINRECT crect
+        GetClientRect(hWnd, &crect)
+
+        ' Dynamic Console Cell Grid Math (80 cols x 27 rows)
+        DOUBLE cellW = crect.right / 80.0
+        DOUBLE cellH = crect.bottom / 27.0
+
+        ' Bounding box for Cover Art: Columns 1..17, Rows 13..23 (11 rows high)
+        INT boxX = INT(cellW * 1.0) + 2
+        INT boxY = INT(cellH * 13.0) + 1
+        INT boxW = INT(cellW * 17.0) - 4
+        INT boxH = INT(cellH * 11.0) - 2
+
+        ' Aspect-Ratio Fitting (Prevents crushing & centers image)
+        INT renderW = boxW
+        INT renderH = boxH
+        INT renderX = boxX
+        INT renderY = boxY
+
+        IF g_CoverW > 0 AND g_CoverH > 0 THEN
+            DOUBLE scaleX = boxW * 1.0 / g_CoverW
+            DOUBLE scaleY = boxH * 1.0 / g_CoverH
+            DOUBLE scale  = scaleX
+            IF scaleY < scaleX THEN scale = scaleY
+
+            renderW = INT(g_CoverW * scale)
+            renderH = INT(g_CoverH * scale)
+
+            ' Center image inside the frame rect
+            renderX = boxX + INT((boxW - renderW) / 2)
+            renderY = boxY + INT((boxH - renderH) / 2)
+        ENDIF
+
+        ' High-Quality Halftone Resampling
+        SetStretchBltMode(hDC, 4) ' HALFTONE = 4
+        SetBrushOrgEx(hDC, 0, 0, 0)
+
+        StretchBlt(hDC, renderX, renderY, renderW, renderH, g_hCoverDC, 0, 0, g_CoverW, g_CoverH, SRCCOPY)
+
+        ReleaseDC(hWnd, hDC)
+    ENDIF
+ENDSUB
+
+SUB DrawExtendedMetadataHUDBuf()
     STRING fullPath  = ConvertANSItoOEM(EnsureANSI(g_Playlist[argIdx]))
     STRING truncPath = TruncatePathSmart(fullPath, 106)
     STRING p1 = "", p2 = ""
 
-    ' Slice across 2 lines: 49 chars after " Path  : ", 57 chars on line 2
     IF LEN(truncPath) <= 49 THEN
-        p1 = truncPath
-        p2 = ""
+        p1 = truncPath : p2 = ""
     ELSE
         p1 = LEFT$(truncPath, 49)
         p2 = MID$(truncPath, 50, 57)
     ENDIF
 
-    ' Compute file size & bitrate locally
     QWORD fSizeBytes = BASS_StreamGetFilePosition(hStream, BASS_FILEPOS_END)
     INT calcBitrate = 0
     IF fSizeBytes > 0q AND totalSecs > 0.0 THEN
@@ -3146,69 +3501,49 @@ SUB DrawExtendedMetadataHUD()
     IF g_chanInfo.chans = 1 THEN chanBitsStr = "Mono"
     IF g_chanInfo.origres > 0 THEN chanBitsStr = chanBitsStr + " (" + LTRIM$(STR$(g_chanInfo.origres)) + "-bit)"
 
-    STRING freqStr = LTRIM$(STR$(g_chanInfo.freq / 1000.0)) + " kHz"
-    STRING audioFmt = codecStr + " / " + freqStr
+    STRING freqStr
+    IF g_chanInfo.freq > 0 THEN
+      INT khzWhole = g_chanInfo.freq / 1000
+      INT khzFrac  = (g_chanInfo.freq % 1000) / 100
+      freqStr = LTRIM$(STR$(khzWhole)) + "." + LTRIM$(STR$(khzFrac)) + " kHz"
+    ELSE
+      freqStr = "--.- kHz"
+    ENDIF
 
+    STRING audioFmt = codecStr + " / " + freqStr
     STRING bitStr = "Unknown"
     IF calcBitrate > 0 THEN bitStr = LTRIM$(STR$(calcBitrate)) + " kbps"
-
     STRING durStr = FormatTimeStr(totalSecs) + " (" + LTRIM$(STR$(INT(totalSecs))) + "s)"
 
     STRING prevStr = g_LastPlayedTitle
-/*
-    ' CLI Resume / Startup Fallback: If no runtime history exists yet, derive from preceding playlist track
-    IF (prevStr = "None" OR prevStr = "") AND argIdx > 0 THEN
-        STRING prevFile = g_Playlist[argIdx - 1]
-        IF prevFile <> "" THEN
-            prevStr = ConvertANSItoOEM(EnsureANSI(GetFileNameOnly(prevFile)))
-        ENDIF
-    ENDIF
-*/
     IF prevStr = "" THEN prevStr = "None"
 
     INT remTracks = g_TrackCount - (argIdx + 1)
     STRING queueStr = "Track " + LTRIM$(STR$(argIdx + 1)) + " of " + LTRIM$(STR$(g_TrackCount)) + " (" + LTRIM$(STR$(remTracks)) + " remaining)"
 
-    ' Construct CP437 Box & Junction Characters
     STRING cBL = CHR$(218), cBR = CHR$(191)
     STRING cVL = CHR$(179), cLT = CHR$(195), cRT = CHR$(180)
     STRING cEL = CHR$(192), cER = CHR$(217)
-    STRING cTT = CHR$(194), cBT = CHR$(193) ' Top-T (-) and Bottom-T (-) junctions
+    STRING cTT = CHR$(194), cBT = CHR$(193)
 
-    SetColor(colTech)
-    ConsoleWrite(19, 13, cBL + CHR$(196) + " EXTENDED METADATA & FILE INFO " + STRING$(26, 196) + cBR)
-    
-    SetColor(colStatic)
-    ConsoleWrite(19, 14, cVL + " Path  : " + LEFT$(p1 + SPACE$(49), 49) + cVL)
-    ConsoleWrite(19, 15, cVL + " " + LEFT$(p2 + SPACE$(57), 57) + cVL)
-    
-    ' Junction bar above 2-column grid
-    SetColor(colTech)
-    ConsoleWrite(19, 16, cLT + STRING$(27, 196) + cTT + STRING$(30, 196) + cRT)
-    
-    ' 2-column Grid with middle vertical separator
-    SetColor(colStatic)
-    ConsoleWrite(19, 17, cVL + " Genre   : " + LEFT$(trackGenre + SPACE$(16), 16) + cVL + " Tag Type : " + LEFT$(tagType + SPACE$(18), 18) + cVL)
-    ConsoleWrite(19, 18, cVL + " Audio   : " + LEFT$(audioFmt + SPACE$(16), 16) + cVL + " Channels : " + LEFT$(chanBitsStr + SPACE$(18), 18) + cVL)
-    ConsoleWrite(19, 19, cVL + " Bitrate : " + LEFT$(bitStr + SPACE$(16), 16) + cVL + " Duration : " + LEFT$(durStr + SPACE$(18), 18) + cVL)
-    
-    ' Junction bar below 2-column grid
-    SetColor(colTech)
-    ConsoleWrite(19, 20, cLT + STRING$(27, 196) + cBT + STRING$(30, 196) + cRT)
-    
-    SetColor(colStatic)
-    ConsoleWrite(19, 21, cVL + " Prev    : " + LEFT$(prevStr + SPACE$(47), 47) + cVL)
-    ConsoleWrite(19, 22, cVL + " Queue   : " + LEFT$(queueStr + SPACE$(47), 47) + cVL)
-    
-    SetColor(colTech)
-    ConsoleWrite(19, 23, cEL + STRING$(58, 196) + cER)
-    SetColor(colStatic)
+    BufWrite(19, 13, cBL + CHR$(196) + " EXTENDED METADATA & FILE INFO " + STRING$(26, 196) + cBR, colTech)
+    BufWrite(19, 14, cVL + " Path  : " + LEFT$(p1 + SPACE$(49), 49) + cVL, colStatic)
+    BufWrite(19, 15, cVL + " " + LEFT$(p2 + SPACE$(57), 57) + cVL, colStatic)
+    BufWrite(19, 16, cLT + STRING$(27, 196) + cTT + STRING$(30, 196) + cRT, colTech)
+    BufWrite(19, 17, cVL + " Genre   : " + LEFT$(trackGenre + SPACE$(16), 16) + cVL + " Tag Type : " + LEFT$(tagType + SPACE$(18), 18) + cVL, colStatic)
+    BufWrite(19, 18, cVL + " Audio   : " + LEFT$(audioFmt + SPACE$(16), 16) + cVL + " Channels : " + LEFT$(chanBitsStr + SPACE$(18), 18) + cVL, colStatic)
+    BufWrite(19, 19, cVL + " Bitrate : " + LEFT$(bitStr + SPACE$(16), 16) + cVL + " Duration : " + LEFT$(durStr + SPACE$(18), 18) + cVL, colStatic)
+    BufWrite(19, 20, cLT + STRING$(27, 196) + cBT + STRING$(30, 196) + cRT, colTech)
+    BufWrite(19, 21, cVL + " Prev    : " + LEFT$(prevStr + SPACE$(47), 47) + cVL, colStatic)
+    BufWrite(19, 22, cVL + " Queue   : " + LEFT$(queueStr + SPACE$(47), 47) + cVL, colStatic)
+    BufWrite(19, 23, cEL + STRING$(58, 196) + cER, colTech)
 ENDSUB
 
-SUB DrawSyncedLyrics(DOUBLE currentSecs, INT startX, INT startY, INT lyrTick)
+SUB DrawSyncedLyricsBuf(DOUBLE currentSecs, INT startX, INT startY, INT lyrTick)
     INT activeIdx = -1, i, lineIdx
-    STRING lineOut, rawText, padText, dispText
-    
+    STRING lineOut, rawText, dispText
+    WORD lineAttr
+
     FOR i = 0 TO g_SyncedCount - 1
         IF currentSecs >= g_SyncedLyrics[i].timestamp THEN activeIdx = i
     NEXT i
@@ -3216,11 +3551,22 @@ SUB DrawSyncedLyrics(DOUBLE currentSecs, INT startX, INT startY, INT lyrTick)
     IF activeIdx <> g_LastActiveLyric THEN
         g_LastActiveLyric = activeIdx
         g_LyricLineChanged = 1
+
+        IF activeIdx >= 0 AND activeIdx < g_SyncedCount THEN
+            rawText = g_SyncedLyrics[activeIdx].text
+            IF LEN(rawText) > 57 THEN
+                STRING padText = rawText + " || "
+                g_LyrMarqueeRing   = padText + padText
+                g_LyrMarqueePeriod = LEN(padText)
+            ELSE
+                g_LyrMarqueeRing   = LEFT$(rawText + SPACE$(57), 57)
+                g_LyrMarqueePeriod = 0
+            ENDIF
+        ENDIF
     ENDIF
 
     IF activeIdx = -1 THEN activeIdx = 0
 
-    ' Center active line within 11-line viewport window
     INT startIdx = activeIdx - 5
     IF startIdx < 0 THEN startIdx = 0
     IF startIdx + 11 > g_SyncedCount THEN startIdx = g_SyncedCount - 11
@@ -3232,19 +3578,16 @@ SUB DrawSyncedLyrics(DOUBLE currentSecs, INT startX, INT startY, INT lyrTick)
             rawText = g_SyncedLyrics[lineIdx].text
             
             IF lineIdx = activeIdx THEN
-                SetColor(colArtist)
-                ' Marquee active line across full 57-char viewport width
-                IF LEN(rawText) > 57 THEN
-                    padText = rawText + " || "
-                    INT mPos = (lyrTick % LEN(padText)) + 1
-                    dispText = LEFT$(MID$(padText, mPos, LEN(padText)) + padText, 57)
+                lineAttr = colArtist
+                IF g_LyrMarqueePeriod > 0 THEN
+                    GetMarqueeSlice(&g_LyrMarqueeRing, g_LyrMarqueePeriod, lyrTick, 57, &g_LyrMarqueeDisp)
+                    dispText = g_LyrMarqueeDisp
                 ELSE
                     dispText = LEFT$(rawText + SPACE$(57), 57)
                 ENDIF
                 lineOut = ">> " + dispText
             ELSE
-                SetColor(colStatic)
-                ' Truncate inactive long lines to 57 chars with visual ellipsis
+                lineAttr = colStatic
                 IF LEN(rawText) > 57 THEN
                     dispText = LEFT$(rawText, 54) + "..."
                 ELSE
@@ -3252,25 +3595,24 @@ SUB DrawSyncedLyrics(DOUBLE currentSecs, INT startX, INT startY, INT lyrTick)
                 ENDIF
                 lineOut = "   " + dispText
             ENDIF
-            ConsoleWrite(startX, startY + i, lineOut)
+            BufWrite(startX, startY + i, lineOut, lineAttr)
         ELSE
-            ' Blank out empty trailing viewport rows
-            ConsoleWrite(startX, startY + i, SPACE$(60))
+            BufWrite(startX, startY + i, SPACE$(60), colStatic)
         ENDIF
     NEXT i
 ENDSUB
 
-SUB DrawTextBoxPtr(POINTER pContent, INT startX, INT startY, INT maxLines, INT scrollOffset)
+SUB DrawTextBoxPtrBuf(POINTER pContent, INT startX, INT startY, INT maxLines, INT scrollOffset, WORD textAttr)
     INT i, lineCount = 0, printedCount = 0, cPos = 0
     ISTRING currentLine[128]
     INT curLineLen = 0, b
-    
+
     FOR i = 0 TO maxLines - 1
-        ConsoleWrite(startX, startY + i, SPACE$(60))
+        BufWrite(startX, startY + i, SPACE$(60), textAttr)
     NEXT i
-    
+
     IF #<BYTE>pContent[0] = 0 THEN RETURN
-    
+
     currentLine[0] = 0
     WHILE #<BYTE>pContent[cPos] <> 0
         b = #<BYTE>pContent[cPos] & 255
@@ -3279,7 +3621,7 @@ SUB DrawTextBoxPtr(POINTER pContent, INT startX, INT startY, INT maxLines, INT s
         ELSEIF b = 10 THEN
             IF lineCount >= scrollOffset THEN
                 currentLine[curLineLen] = 0
-                ConsoleWrite(startX, startY + printedCount, currentLine)
+                BufWrite(startX, startY + printedCount, currentLine, textAttr)
                 printedCount = printedCount + 1
             ENDIF
             curLineLen = 0
@@ -3293,47 +3635,37 @@ SUB DrawTextBoxPtr(POINTER pContent, INT startX, INT startY, INT maxLines, INT s
         ENDIF
         cPos = cPos + 1
     ENDWHILE
-    
+
     IF printedCount < maxLines AND curLineLen > 0 AND lineCount >= scrollOffset THEN
         currentLine[curLineLen] = 0
-        ConsoleWrite(startX, startY + printedCount, currentLine)
+        BufWrite(startX, startY + printedCount, currentLine, textAttr)
     ENDIF
 ENDSUB
 
-SUB RefreshExtendedDisplay(POINTER pCom, POINTER pLyr, DOUBLE currentSecs, INT lyrTick)
+SUB RefreshExtendedDisplayBuf(POINTER pCom, POINTER pLyr, DOUBLE currentSecs, INT lyrTick)
     SELECT g_ExtDisplay
         CASE 1
-            ' View 1: Comments View
             IF #<BYTE>pCom[0] <> 0 THEN
-                SetColor(colTitle)
-                DrawTextBoxPtr(pCom, 19, 13, 11, g_CommentPage * 11)
-                SetColor(colStatic)
+                DrawTextBoxPtrBuf(pCom, 19, 13, 11, g_CommentPage * 11, colTitle)
             ELSE
-                ' No comments available -> Fallback to Metadata HUD
-                DrawExtendedMetadataHUD()
+                DrawExtendedMetadataHUDBuf()
             ENDIF
 
         CASE 2
-            ' View 2: Lyrics View (Synced or Static)
             IF g_IsSyncedLyrics = 1 THEN
-                DrawSyncedLyrics(currentSecs, 19, 13, lyrTick)
+                DrawSyncedLyricsBuf(currentSecs, 19, 13, lyrTick)
             ELSEIF #<BYTE>pLyr[0] <> 0 THEN
-                SetColor(colArtist)
-                DrawTextBoxPtr(pLyr, 19, 13, 11, g_CommentPage * 11)
-                SetColor(colStatic)
+                DrawTextBoxPtrBuf(pLyr, 19, 13, 11, g_CommentPage * 11, colArtist)
             ELSE
-                ' No lyrics available -> Fallback to Metadata HUD
-                DrawExtendedMetadataHUD()
+                DrawExtendedMetadataHUDBuf()
             ENDIF
 
         CASE 3
-            ' View 3: Extended Metadata HUD
-            DrawExtendedMetadataHUD()
+            DrawExtendedMetadataHUDBuf()
 
         DEFAULT
-            ' Fallback for 0 or unassigned state -> Default to Metadata HUD (no empty black space)
             g_ExtDisplay = 3
-            DrawExtendedMetadataHUD()
+            DrawExtendedMetadataHUDBuf()
     ENDSELECT
 ENDSUB
 
@@ -3377,7 +3709,7 @@ IF cliArgCount > 2 OR cliArg = "" THEN
     PRINT " (-/    (-|__) (-|     (-/_| (-\_/  "
     PRINT "  _\__,  _|     _|__,  _/  |,  _|,  "
     PRINT " (      (      (      (       (     "
-    PRINT " Fast Console Audio Player      v2.0"
+    PRINT " Fast Console Audio Player      v2.1"
     PRINT " (c) Y. Dalissier"
     PRINT ""
     PRINT "Usage:"
@@ -3414,7 +3746,7 @@ EnsureDefaultEQProfiles()
 EnumerateAudioDevices()
 LoadConfig()
 SetTheme()
-DrawStaticHUD()
+DrawStaticHUDBuf()
 
 ' If launched with -r, force Resume Mode active
 IF isResumeMode = 1 THEN g_ResumePos = 1
@@ -3431,6 +3763,17 @@ ENDIF
 g_History[0] = 0
 g_HistoryPos = 0
 g_HistoryMax = 0
+
+' Initialize Microsecond Frame Pacing (Target: 20 FPS = 50ms frame budget)
+QueryPerformanceFrequency(&g_qpfFreq)
+IF g_qpfFreq > 0q THEN
+    INT64 tpm64 = g_qpfFreq / 1000q
+    POINTER pTpm = &tpm64
+    g_ticksPerMs = #<INT>pTpm
+
+    g_qpcTargetTicks = tpm64 * 50q
+ENDIF
+timeBeginPeriod(1)
 
 WHILE argIdx < g_TrackCount
 
@@ -3482,32 +3825,42 @@ WHILE argIdx < g_TrackCount
 
         marqueeTick = 0 : marqueeOffset = 0
 
-        ' Initial HUD View Routing
+        ' Initial HUD View Routing (Fully Buffer-Blitted)
         SELECT g_InOptionsView
             CASE 0
-                SetConsolePos(13, 2) : SetColor(colArtist) : PRINT g_DispArtist
-                SetConsolePos(13, 3) : SetColor(colTitle)  : PRINT g_DispTitle
-                SetConsolePos(13, 4) : SetColor(colAlbum)  : PRINT g_DispAlbum
+                BufClear(C_BLACK)
+                DrawStaticHUDBuf()
 
-                SetConsolePos(13, 5) : SetColor(colVol)    : PRINT LEFT$(g_trackYear + SPACE$(21), 21)
-                SetConsolePos(42, 5) : SetColor(colVol)    : PRINT LEFT$(g_trackNum + SPACE$(24), 24)
+                BufWrite(13, 2, g_DispArtist, colArtist)
+                BufWrite(13, 3, g_DispTitle, colTitle)
+                BufWrite(13, 4, g_DispAlbum, colAlbum)
 
-                SetConsolePos(13, 6) : SetColor(colQueue)
+                BufWrite(13, 5, LEFT$(g_trackYear + SPACE$(21), 21), colVol)
+                BufWrite(43, 5, LEFT$(g_trackNum + SPACE$(24), 24), colVol)
+
                 STRING shufStr
                 IF g_Shuffle = 1 THEN shufStr = "ON " ELSE shufStr = "OFF"
-                PRINT "[" + RIGHT$("     " + LTRIM$(STR$(argIdx + 1)), 5) + " / " + RIGHT$("     " + LTRIM$(STR$(g_TrackCount)), 5) + "]" + SPACE$(26) + "SHUFFLE: " + shufStr
+                BufWrite(13, 6, "[" + RIGHT$("     " + LTRIM$(STR$(argIdx + 1)), 5) + " / " + RIGHT$("     " + LTRIM$(STR$(g_TrackCount)), 5) + "]" + SPACE$(26) + "SHUFFLE: " + shufStr, colQueue)
 
-                SetConsolePos(13, 9)  : SetColor(colVol)  : PRINT LEFT$(g_SpecFmt + SPACE$(53), 53)
-                SetConsolePos(13, 10) : SetColor(colTech) : PRINT LEFT$(g_SpecBit + SPACE$(53), 53)
-                SetConsolePos(13, 11) : SetColor(colVol)  : PRINT LEFT$(g_SpecSiz + SPACE$(53), 53)
+                BufWrite(13, 9, LEFT$(g_SpecFmt + SPACE$(53), 53), colVol)
+                BufWrite(12, 10, LEFT$(g_SpecBit + SPACE$(53), 53), colTech)
+                BufWrite(12, 11, LEFT$(g_SpecSiz + SPACE$(53), 53), colVol)
 
-                RefreshExtendedDisplay(g_pComments, g_pLyrics, 0.0, marqueeOffset)
-                DrawCoverArt(hStream, g_Playlist[argIdx])
+                RefreshExtendedDisplayBuf(g_pComments, g_pLyrics, 0.0, marqueeOffset)
+
+                ' Full flush to wipe previous track graphics/text
+                FlushFrameBufferFull(g_hConsole)
+
+                ' Paint cover art ONCE
+                RenderCoverArtFast()
+
             CASE 1
                 SwitchToOptionsView()
+
             CASE 2
                 DrawMoreOptionsScreen()
         ENDSELECT
+
 
         BASS_ChannelPlay(hStream, 0)
         skipTrack = 0
@@ -3526,68 +3879,83 @@ WHILE argIdx < g_TrackCount
             INT playingState = 0
             IF BASS_ChannelIsActive(hStream) = BASS_ACTIVE_PLAYING THEN playingState = 1
 
-            ' --- PLAYER VIEW UI RENDERING ---
             SELECT g_InOptionsView
                 CASE 0
-                    DrawStatusLine(playingState, currentSecs, totalSecs, g_Volume)
-                    SetConsolePos(13, 8) : SetColor(colProg) : DrawProgressBar(currentSecs, totalSecs, 46) : SetColor(colStatic)
-            
+                    ' 1. Update Dynamic Metadata & Specs
+                    BufWrite(13, 2, g_DispArtist, colArtist)
+                    BufWrite(13, 3, g_DispTitle, colTitle)
+                    BufWrite(13, 4, g_DispAlbum, colAlbum)
+
+                    ' 2. Render Dynamic Playback Controls & Progress Bar
+                    DrawStatusLineBuf(playingState, currentSecs, totalSecs, g_Volume)
+                    DrawProgressBarBuf(currentSecs, totalSecs, 13, 8, 46)
+
+                    ' 3. Sample & Render VU Towers
                     vuLevel = BASS_ChannelGetLevel(hStream)
                     lLevel = 0 : rLevel = 0
                     IF vuLevel <> -1 THEN
                         lLevel = vuLevel & 0xFFFF
                         rLevel = (vuLevel / 65536) & 0xFFFF
                     ENDIF
-                    DrawVerticalMeter(lLevel, rLevel, 73, 2, 10)
+                    DrawVerticalMeterBuf(lLevel, rLevel, 73, 2, 10)
 
+                    ' 4. Flush Region 1 (Top HUD/VU Meters) - Skipped if identical / paused
+                    FlushTopHUD(g_hConsole)
+
+                    ' 5. Process Zero-Allocation Marquee Tick
+                    INT extNeedsFlush = 0
                     marqueeTick = marqueeTick + 1
-                    IF marqueeTick >= 5 THEN
+                    IF marqueeTick >= MARQUEE_SPEED_DIV THEN
                         marqueeTick = 0 : marqueeOffset = marqueeOffset + 1
-                        IF LEN(g_TrackArtist) > 53 THEN
-                            mArt = (marqueeOffset % LEN(g_PadArtist)) + 1
-                            g_DispArtist = LEFT$(MID$(g_PadArtist, mArt, LEN(g_PadArtist)) + g_PadArtist, 53)
-                            SetConsolePos(13, 2) : SetColor(colArtist) : PRINT g_DispArtist
-                        ENDIF
-                        IF LEN(g_TrackTitle) > 53 THEN
-                            mTit = (marqueeOffset % LEN(g_PadTitle)) + 1
-                            g_DispTitle = LEFT$(MID$(g_PadTitle, mTit, LEN(g_PadTitle)) + g_PadTitle, 53)
-                            SetConsolePos(13, 3) : SetColor(colTitle) : PRINT g_DispTitle
-                        ENDIF
-                        IF LEN(g_TrackAlbum) > 53 THEN
-                            mAlb = (marqueeOffset % LEN(g_PadAlbum)) + 1
-                            g_DispAlbum = LEFT$(MID$(g_PadAlbum, mAlb, LEN(g_PadAlbum)) + g_PadAlbum, 53)
-                            SetConsolePos(13, 4) : SetColor(colAlbum) : PRINT g_DispAlbum
-                        ENDIF
-                        SetColor(colStatic)
 
-                        IF g_ExtDisplay <> 0 AND ((g_ExtDisplay = 1 AND g_pComments[0] = 0) OR (g_ExtDisplay = 2 AND g_pLyrics[0] = 0 AND g_IsSyncedLyrics = 0)) THEN
-                            RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                        IF g_PeriodArtist > 0 THEN
+                            GetMarqueeSlice(&g_RingArtist, g_PeriodArtist, marqueeOffset, 53, &g_DispArtistBuf)
+                            g_DispArtist = g_DispArtistBuf
                         ENDIF
+
+                        IF g_PeriodTitle > 0 THEN
+                            GetMarqueeSlice(&g_RingTitle, g_PeriodTitle, marqueeOffset, 53, &g_DispTitleBuf)
+                            g_DispTitle = g_DispTitleBuf
+                        ENDIF
+
+                        IF g_PeriodAlbum > 0 THEN
+                            GetMarqueeSlice(&g_RingAlbum, g_PeriodAlbum, marqueeOffset, 53, &g_DispAlbumBuf)
+                            g_DispAlbum = g_DispAlbumBuf
+                        ENDIF
+
+                        extNeedsFlush = 1
                     ENDIF
 
+                    ' 6. Render Extended Display (Flush Region 2 ONLY on lyric line step or marquee tick)
+                    INT lyrChanged = 0
+                    IF g_ExtDisplay = 2 AND g_IsSyncedLyrics = 1 THEN
+                        INT curLyricIdx = -1, lIdx
+                        FOR lIdx = 0 TO g_SyncedCount - 1
+                            IF currentSecs >= g_SyncedLyrics[lIdx].timestamp THEN curLyricIdx = lIdx
+                        NEXT lIdx
+                        IF curLyricIdx <> g_LastActiveLyric THEN lyrChanged = 1
+                    ENDIF
+
+                    IF lyrChanged = 1 OR extNeedsFlush = 1 THEN
+                        RefreshExtendedDisplayBuf(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                        FlushExtendedRegion(g_hConsole)
+                    ENDIF
+
+                    ' 7. Window Restoration Cover Art Check
                     UINT conHwnd = GetConsoleWindow()
                     IF IsIconic(conHwnd) <> 0 THEN
                         wasMinimized = 1
                     ELSE
                         IF wasMinimized = 1 THEN
-                            Sleep(100)
-                            DrawCoverArt(hStream, g_Playlist[argIdx])
+                            RenderCoverArtFast()
                             wasMinimized = 0
-                        ENDIF
-                    ENDIF
-
-                    IF g_ExtDisplay = 2 AND g_IsSyncedLyrics = 1 THEN
-                        RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
-                        IF g_LyricLineChanged = 1 THEN
-                            DrawCoverArt(hStream, g_Playlist[argIdx])
-                            g_LyricLineChanged = 0
                         ENDIF
                     ENDIF
 
                 CASE 3
                     ' --- PLAYLIST BROWSER MARQUEE ANIMATION ---
                     plMarqueeTick = plMarqueeTick + 1
-                    IF plMarqueeTick >= 5 THEN
+                    IF plMarqueeTick >= MARQUEE_SPEED_DIV THEN
                         plMarqueeTick = 0
                         plMarqueeOffset = plMarqueeOffset + 1
                         DrawPlaylistScreen()
@@ -3616,6 +3984,7 @@ WHILE argIdx < g_TrackCount
                                             g_PlaylistScrollOffset = g_PlaylistSelectIdx
                                         ENDIF
                                         plMarqueeOffset = 0 : plMarqueeTick = 0
+                                        InitPlMarqueeRing()
                                         DrawPlaylistScreen()
                                     ENDIF
                                 ENDIF
@@ -3631,6 +4000,7 @@ WHILE argIdx < g_TrackCount
                                             g_PlaylistScrollOffset = g_PlaylistSelectIdx - 18
                                         ENDIF
                                         plMarqueeOffset = 0 : plMarqueeTick = 0
+                                        InitPlMarqueeRing()
                                         DrawPlaylistScreen()
                                     ENDIF
                                 ENDIF
@@ -3645,6 +4015,7 @@ WHILE argIdx < g_TrackCount
                                     g_PlaylistScrollOffset = g_PlaylistScrollOffset - 19
                                     IF g_PlaylistScrollOffset < 0 THEN g_PlaylistScrollOffset = 0
                                     plMarqueeOffset = 0 : plMarqueeTick = 0
+                                    InitPlMarqueeRing()
                                     DrawPlaylistScreen()
                                 ENDIF
                             ELSE : plPgUpPushed = 0 : ENDIF
@@ -3659,6 +4030,7 @@ WHILE argIdx < g_TrackCount
                                         g_PlaylistScrollOffset = g_PlaylistSelectIdx - 18
                                     ENDIF
                                     plMarqueeOffset = 0 : plMarqueeTick = 0
+                                    InitPlMarqueeRing()
                                     DrawPlaylistScreen()
                                 ENDIF
                             ELSE : plPgDnPushed = 0 : ENDIF
@@ -3817,24 +4189,6 @@ WHILE argIdx < g_TrackCount
                                             DrawMoreOptionsScreen()
                                         CASE 5 ' Resume Position Toggle
                                             g_ResumePos = 1 - g_ResumePos
-                                            DrawMoreOptionsScreen()
-                                    ENDSELECT
-                                ENDIF
-                            ELSE : optRightDown = 0 : ENDIF
-
-                            IF (GetAsyncKeyState(0x27) & 0x8000) <> 0 THEN ' RIGHT
-                                IF optRightDown = 0 THEN
-                                    optRightDown = 1
-                                    SELECT g_MoreFocus
-                                        CASE 0 ' Balance Right
-                                            IF g_Balance < 100 THEN g_Balance = g_Balance + 5
-                                            ApplyAudioAttributes(hStream)
-                                            DrawMoreOptionsScreen()
-                                        CASE 2 ' Output Device Next
-                                            IF g_SelectedDevice < g_AudioDeviceCount - 1 THEN SwitchAudioOutputDevice(g_SelectedDevice + 1)
-                                            DrawMoreOptionsScreen()
-                                        CASE 3 ' Crossfade Increase
-                                            IF g_Crossfade < 5 THEN g_Crossfade = g_Crossfade + 1
                                             DrawMoreOptionsScreen()
                                     ENDSELECT
                                 ENDIF
@@ -4144,7 +4498,7 @@ WHILE argIdx < g_TrackCount
                             ENDIF
 
                             g_CommentTick = g_CommentTick + 1
-                            IF g_CommentTick >= 300 THEN
+                            IF g_CommentTick >= 15000 THEN
                                 g_CommentTick = 0
                                 g_CommentPage = g_CommentPage + 1
 
@@ -4152,12 +4506,12 @@ WHILE argIdx < g_TrackCount
                                     CASE 1
                                         IF g_pComments[0] <> 0 THEN
                                             IF g_CommentPage * 11 >= commentLines THEN g_CommentPage = 0
-                                            RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                                            RefreshExtendedDisplayBuf(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
                                         ENDIF
                                     CASE 2
                                         IF g_IsSyncedLyrics = 0 AND g_pLyrics[0] <> 0 THEN
                                             IF g_CommentPage * 11 >= lyricLines THEN g_CommentPage = 0
-                                            RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                                            RefreshExtendedDisplayBuf(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
                                         ENDIF
                                 ENDSELECT
                             ENDIF
@@ -4181,11 +4535,11 @@ WHILE argIdx < g_TrackCount
                                     CASE "c"
                                         IF g_ExtDisplay = 1 THEN g_ExtDisplay = 0 ELSE g_ExtDisplay = 1
                                         g_CommentPage = 0 : g_CommentTick = 0 : g_LastActiveLyric = -2
-                                        RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                                        RefreshExtendedDisplayBuf(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
                                     CASE "l"
                                         IF g_ExtDisplay = 2 THEN g_ExtDisplay = 0 ELSE g_ExtDisplay = 2
                                         g_CommentPage = 0 : g_CommentTick = 0 : g_LastActiveLyric = -2
-                                        RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                                        RefreshExtendedDisplayBuf(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
                                     CASE "o"
                                         SwitchToOptionsView()
                                     CASE "b"
@@ -4193,22 +4547,9 @@ WHILE argIdx < g_TrackCount
                                     CASE "t"
                                         g_Theme = g_Theme + 1 : IF g_Theme > 6 THEN g_Theme = 0
                                         SetTheme()
-                                        SetConsolePos(13, 2) : SetColor(colArtist) : PRINT g_DispArtist
-                                        SetConsolePos(13, 3) : SetColor(colTitle)  : PRINT g_DispTitle
-                                        SetConsolePos(13, 4) : SetColor(colAlbum)  : PRINT g_DispAlbum
-                                        SetConsolePos(13, 5) : SetColor(colVol)    : PRINT LEFT$(g_trackYear + SPACE$(21), 21)
-                                        SetConsolePos(42, 5) : SetColor(colVol)    : PRINT LEFT$(g_trackNum + SPACE$(24), 24)
-                                        SetConsolePos(13, 6) : SetColor(colQueue)
-                                        IF g_Shuffle = 1 THEN shufStr = "ON " ELSE shufStr = "OFF"
-                                        PRINT "[" + RIGHT$("     " + LTRIM$(STR$(argIdx + 1)), 5) + " / " + RIGHT$("     " + LTRIM$(STR$(g_TrackCount)), 5) + "]" + SPACE$(26) + "SHUFFLE: " + shufStr
-                                        
-                                        SetConsolePos(13, 9)  : SetColor(colVol)  : PRINT LEFT$(g_SpecFmt + SPACE$(53), 53)
-                                        SetConsolePos(13, 10) : SetColor(colTech) : PRINT LEFT$(g_SpecBit + SPACE$(53), 53)
-                                        SetConsolePos(13, 11) : SetColor(colVol)  : PRINT LEFT$(g_SpecSiz + SPACE$(53), 53)
-
+                                        RenderCoverArtFast()
                                         g_LastActiveLyric = -2
-                                        RefreshExtendedDisplay(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
-                                        DrawCoverArt(hStream, g_Playlist[argIdx])
+                                        
                                 ENDSELECT
                             ENDIF
                     ENDSELECT
@@ -4218,7 +4559,8 @@ WHILE argIdx < g_TrackCount
             ' Pass addresses via & to allow in-place handle swapping
             CheckStreamTransition(&hStream, &argIdx)
 
-            Sleep(50)
+            ' Microsecond-accurate frame pacing (Replaces coarse Sleep(50))
+            SyncFramePacing(&g_qpcFrameStart)
         WEND
         
         BASS_ChannelStop(hStream)
@@ -4348,6 +4690,8 @@ WHILE argIdx < g_TrackCount
 ENDWHILE
 
 LABEL CleanupExit
+
+timeEndPeriod(1)
 IF g_ResumePos = 1 AND hStream <> 0 THEN
     g_LastTrackIdx = argIdx
     g_LastTrackPos = BASS_ChannelGetPosition(hStream)
