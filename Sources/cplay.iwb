@@ -423,13 +423,16 @@ ENDSUB
 
 SUB RedrawPlayerView()
     IF hPlayBuffer = 0 OR hPlayBuffer = -1 THEN RETURN
+    ' 1. Disable screen updating on the console window
+    LockWindowUpdate(g_hConsole)
 
-    ' Re-activate player console buffer
+    ' 2. Re-activate player console buffer
     g_InOptionsView = 0
     g_hConsole = hPlayBuffer
     SetStdHandle(-11, hPlayBuffer)
     SetConsoleActiveScreenBuffer(hPlayBuffer)
 
+    ' 3. Perform all standard console drawing & buffer flushes
     BufClear(C_BLACK)
     DrawStaticHUDBuf()
 
@@ -442,7 +445,8 @@ SUB RedrawPlayerView()
 
     STRING shufStr
     IF g_Shuffle = 1 THEN shufStr = "ON " ELSE shufStr = "OFF"
-    BufWrite(13, 6, "[" + RIGHT$("     " + LTRIM$(STR$(argIdx + 1)), 5) + " / " + RIGHT$("     " + LTRIM$(STR$(g_TrackCount)), 5) + "]" + SPACE$(26) + "SHUFFLE: " + shufStr, colQueue)
+    BufWrite(13, 6, "[" + RIGHT$("     " + LTRIM$(STR$(argIdx + 1)), 5) + " / " + RIGHT$("     " + LTRIM$(STR$(g_TrackCount)), 5) + "]" + _
+SPACE$(26) + "SHUFFLE: " + shufStr, colQueue)
 
     BufWrite(13, 9, LEFT$(g_SpecFmt + SPACE$(53), 53), colVol)
     BufWrite(12, 10, LEFT$(g_SpecBit + SPACE$(53), 53), colTech)
@@ -453,8 +457,11 @@ SUB RedrawPlayerView()
     ' Flush RAM matrix to active buffer
     FlushFrameBuffer(g_hConsole)
 
-    ' Render GDI Cover Art
+    ' 4. Render the cover art via GDI+
     RenderCoverArtFast()
+
+    ' 5. Re-enable updating and force a single atomic repaint
+    LockWindowUpdate(NULL)
 ENDSUB
 
 SUB SwitchToOptionsView()
@@ -885,8 +892,27 @@ SUB PreloadNextTrack(INT currentIdx)
         RETURN
     ENDIF
 
-    IF g_Shuffle = 1 THEN
-        g_NextTrackIdx = RND(g_TrackCount - 1)
+IF g_Shuffle = 1 THEN
+        IF g_PlayedCount >= g_TrackCount THEN RETURN
+
+        INT unplayedRem = g_TrackCount - g_PlayedCount
+        IF unplayedRem <= 0 THEN RETURN
+
+        INT targetPick  = INT(RND(unplayedRem)) + 1
+        INT curUnplayed = 0, pScan = 0
+
+        WHILE pScan < g_TrackCount
+            IF LEN(g_Playlist[pScan]) > 0 THEN
+                IF g_Played[pScan] = 0 THEN
+                    curUnplayed = curUnplayed + 1
+                    IF curUnplayed = targetPick THEN
+                        g_NextTrackIdx = pScan
+                        pScan = g_TrackCount
+                    ENDIF
+                ENDIF
+            ENDIF
+            pScan = pScan + 1
+        ENDWHILE
     ELSE
         g_NextTrackIdx = currentIdx + 1
         IF g_NextTrackIdx >= g_TrackCount THEN g_NextTrackIdx = 0
@@ -1021,6 +1047,12 @@ SUB CheckStreamTransition(POINTER phStream, POINTER pargIdx)
         #<DWORD>phStream = hNewStream
         #<INT>pargIdx    = g_NextTrackIdx
 
+        ' Lock played state before metadata extraction
+        IF g_Played[g_NextTrackIdx] = 0 THEN
+            g_Played[g_NextTrackIdx] = 1
+            g_PlayedCount = g_PlayedCount + 1
+        ENDIF
+
         g_hNextStream = 0
         g_PreloadDone = 0
 
@@ -1042,6 +1074,12 @@ SUB CheckStreamTransition(POINTER phStream, POINTER pargIdx)
 
             #<DWORD>phStream = g_hNextStream
             #<INT>pargIdx    = g_NextTrackIdx
+
+            ' Lock played state before metadata extraction
+            IF g_Played[g_NextTrackIdx] = 0 THEN
+              g_Played[g_NextTrackIdx] = 1
+              g_PlayedCount = g_PlayedCount + 1
+            ENDIF
 
             hStream = g_hNextStream
             argIdx  = g_NextTrackIdx
@@ -2637,9 +2675,10 @@ SUB InitAudioEngine(), INT
         targetDevice = g_AudioDeviceIDs[g_SelectedDevice]
     ENDIF
 
-    BASS_SetConfig(BASS_CONFIG_UPDATEPERIOD, 50)
-    BASS_SetConfig(BASS_CONFIG_BUFFER, 1000)
-    BASS_SetConfig(BASS_CONFIG_DEV_BUFFER, 50)
+    ' Optimized BASS Buffer Configurations
+    BASS_SetConfig(BASS_CONFIG_UPDATEPERIOD, 20)  ' 20ms update period for tighter timing
+    BASS_SetConfig(BASS_CONFIG_BUFFER, 2000)       ' 2000ms overall stream buffer
+    BASS_SetConfig(BASS_CONFIG_DEV_BUFFER, 100)    ' 100ms hardware device buffer headroom
 
     ' Initialize target output device (fallback to default -1 if targeted initialization fails)
     initResult = BASS_Init(targetDevice, 44100, BASS_DEVICE_DMIX, 0, 0)
@@ -3200,6 +3239,9 @@ SUB LoadTrackMetadata(DWORD hStream, INT argIdx)
     ' 9. Clear shadow buffers so FlushTopHUD & FlushExtendedRegion force a conhost redraw
     RtlZeroMemory(&g_PrevTopBuf, 4160)
     RtlZeroMemory(&g_PrevExtBuf, 3520)
+    
+    ' Force lyric/metadata frame dirty flag
+    g_LastActiveLyric = -2
 ENDSUB
 
 SUB TruncatePathSmart(STRING fullPath, INT maxLen), STRING
@@ -3279,37 +3321,55 @@ ENDSUB
 SUB FilterPlaylist()
     INT i
     g_FilteredCount = 0
-    STRING searchLower = LCASE$(g_SearchBuf)
+    STRING searchLower = LCASE$(LTRIM$(RTRIM$(g_SearchBuf)))
     
     plMarqueeOffset = 0
-    plMarqueeTick = 0
+    plMarqueeTick   = 0
 
+    ' 1. Fast Pass: Empty Search Buffer
     IF searchLower = "" THEN
         FOR i = 0 TO g_TrackCount - 1
             g_FilteredIndices[i] = i
         NEXT i
         g_FilteredCount = g_TrackCount
     ELSE
+        ' 2. Filter Pass: Match against File Name or Path
+        STRING fileNameOnly
         FOR i = 0 TO g_TrackCount - 1
-            IF INSTR(LCASE$(g_Playlist[i]), searchLower) > 0 THEN
+            ' Extract filename to prioritize quick matches
+            fileNameOnly = LCASE$(GetFileNameOnly(g_Playlist[i]))
+            
+            IF INSTR(fileNameOnly, searchLower) > 0 OR INSTR(LCASE$(g_Playlist[i]), searchLower) > 0 THEN
                 g_FilteredIndices[g_FilteredCount] = i
                 g_FilteredCount = g_FilteredCount + 1
             ENDIF
         NEXT i
     ENDIF
 
-    ' Clamp selection index within new filtered bounds
+    ' 3. Clamp Selection Index
     IF g_PlaylistSelectIdx >= g_FilteredCount THEN
         g_PlaylistSelectIdx = g_FilteredCount - 1
     ENDIF
     IF g_PlaylistSelectIdx < 0 THEN g_PlaylistSelectIdx = 0
 
-    ' Clamp scroll position
-    IF g_PlaylistScrollOffset > g_PlaylistSelectIdx THEN
-        g_PlaylistScrollOffset = g_PlaylistSelectIdx
+    ' 4. Smart Viewport Scroll Clamping (Fits 19 Visible Rows)
+    IF g_FilteredCount <= 19 THEN
+        g_PlaylistScrollOffset = 0
+    ELSE
+        ' Keep focus within visible window bounds [ScrollOffset ... ScrollOffset + 18]
+        IF g_PlaylistSelectIdx < g_PlaylistScrollOffset THEN
+            g_PlaylistScrollOffset = g_PlaylistSelectIdx
+        ELSEIF g_PlaylistSelectIdx >= g_PlaylistScrollOffset + 19 THEN
+            g_PlaylistScrollOffset = g_PlaylistSelectIdx - 18
+        ENDIF
+
+        ' Guard against bottom whitespace over-scrolling
+        IF g_PlaylistScrollOffset + 19 > g_FilteredCount THEN
+            g_PlaylistScrollOffset = g_FilteredCount - 19
+        ENDIF
     ENDIF
 
-    ' Re-initialize marquee ring buffer for newly focused row
+    ' 5. Refresh Marquee Ring Buffer for Focused Track
     InitPlMarqueeRing()
 ENDSUB
 
@@ -3518,8 +3578,18 @@ SUB DrawExtendedMetadataHUDBuf()
     STRING prevStr = g_LastPlayedTitle
     IF prevStr = "" THEN prevStr = "None"
 
-    INT remTracks = g_TrackCount - (argIdx + 1)
-    STRING queueStr = "Track " + LTRIM$(STR$(argIdx + 1)) + " of " + LTRIM$(STR$(g_TrackCount)) + " (" + LTRIM$(STR$(remTracks)) + " remaining)"
+    INT remTracks = 0
+    STRING queueStr = ""
+
+    IF g_Shuffle = 1 THEN
+        remTracks = g_TrackCount - g_PlayedCount
+        queueStr = "Track " + LTRIM$(STR$(argIdx + 1)) + " of " + LTRIM$(STR$(g_TrackCount)) + " (" + LTRIM$(STR$(remTracks)) + _
+" unplayed left)"
+    ELSE
+        remTracks = g_TrackCount - (argIdx + 1)
+        queueStr = "Track " + LTRIM$(STR$(argIdx + 1)) + " of " + LTRIM$(STR$(g_TrackCount)) + " (" + LTRIM$(STR$(remTracks)) + _
+" remaining)"
+    ENDIF
 
     STRING cBL = CHR$(218), cBR = CHR$(191)
     STRING cVL = CHR$(179), cLT = CHR$(195), cRT = CHR$(180)
@@ -3530,9 +3600,12 @@ SUB DrawExtendedMetadataHUDBuf()
     BufWrite(19, 14, cVL + " Path  : " + LEFT$(p1 + SPACE$(49), 49) + cVL, colStatic)
     BufWrite(19, 15, cVL + " " + LEFT$(p2 + SPACE$(57), 57) + cVL, colStatic)
     BufWrite(19, 16, cLT + STRING$(27, 196) + cTT + STRING$(30, 196) + cRT, colTech)
-    BufWrite(19, 17, cVL + " Genre   : " + LEFT$(trackGenre + SPACE$(16), 16) + cVL + " Tag Type : " + LEFT$(tagType + SPACE$(18), 18) + cVL, colStatic)
-    BufWrite(19, 18, cVL + " Audio   : " + LEFT$(audioFmt + SPACE$(16), 16) + cVL + " Channels : " + LEFT$(chanBitsStr + SPACE$(18), 18) + cVL, colStatic)
-    BufWrite(19, 19, cVL + " Bitrate : " + LEFT$(bitStr + SPACE$(16), 16) + cVL + " Duration : " + LEFT$(durStr + SPACE$(18), 18) + cVL, colStatic)
+    BufWrite(19, 17, cVL + " Genre   : " + LEFT$(trackGenre + SPACE$(16), 16) + cVL + " Tag Type : " + LEFT$(tagType + SPACE$(18), 18) + _
+cVL, colStatic)
+    BufWrite(19, 18, cVL + " Audio   : " + LEFT$(audioFmt + SPACE$(16), 16) + cVL + " Channels : " + LEFT$(chanBitsStr + SPACE$(18), 18) + _
+cVL, colStatic)
+    BufWrite(19, 19, cVL + " Bitrate : " + LEFT$(bitStr + SPACE$(16), 16) + cVL + " Duration : " + LEFT$(durStr + SPACE$(18), 18) + _
+cVL, colStatic)
     BufWrite(19, 20, cLT + STRING$(27, 196) + cBT + STRING$(30, 196) + cRT, colTech)
     BufWrite(19, 21, cVL + " Prev    : " + LEFT$(prevStr + SPACE$(47), 47) + cVL, colStatic)
     BufWrite(19, 22, cVL + " Queue   : " + LEFT$(queueStr + SPACE$(47), 47) + cVL, colStatic)
@@ -3727,6 +3800,7 @@ ENDIF
 InitConsoleScreen()
 InitEQFrequencies()
 
+SetConsoleTitleA(cliArg)
 PRINT "Loading : Please Wait ..."
 ProcessArgument(cliArg)
 
@@ -3779,8 +3853,14 @@ WHILE argIdx < g_TrackCount
 
     pTrack = g_Playlist[argIdx]
 
-    ' Create stream with Mono Downmix & Prescan support
+    ' 1. Create stream with Mono Downmix & Prescan support
     hStream = CreateTrackStream(g_Playlist[argIdx])
+
+    ' 2. Pause playback immediately
+    BASS_ChannelPause(hStream)
+
+    ' 3. Request BASS to prebuffer the stream (e.g. 1000ms to 2000ms)
+    BASS_ChannelPreBuf(hStream, 1000)
 
     ' Restore byte position if Resume Position is active
     IF g_ResumePos = 1 AND g_LastTrackPos > 0q AND hStream <> 0 THEN
@@ -3803,7 +3883,6 @@ WHILE argIdx < g_TrackCount
         Sleep(1200)
     ELSE
         ' Trace("  -> Stream created successfully via CreateTrackStream. Handle: " + LTRIM$(STR$(hStream)))
-
         ' Fetch active channel attributes & synchronize volume
         INT curFreq, curVol, curPan
         BASS_ChannelGetAttributes(hStream, &curFreq, &curVol, &curPan)
@@ -3814,6 +3893,11 @@ WHILE argIdx < g_TrackCount
 
         ' Load initial track metadata
         LoadTrackMetadata(hStream, argIdx)
+
+        IF g_Played[argIdx] = 0 THEN
+            g_Played[argIdx] = 1
+            g_PlayedCount = g_PlayedCount + 1
+        ENDIF
 /*
         ' Populate previous track title for resumed sessions
         IF (g_LastPlayedTitle = "None" OR g_LastPlayedTitle = "") AND argIdx > 0 THEN
@@ -4546,8 +4630,8 @@ WHILE argIdx < g_TrackCount
                                         SwitchToPlaylistView()
                                     CASE "t"
                                         g_Theme = g_Theme + 1 : IF g_Theme > 6 THEN g_Theme = 0
-                                        SetTheme()
-                                        RenderCoverArtFast()
+                                        SetTheme()             ' Updates color variables & populates g_FrameBuf
+                                        RedrawPlayerView()     ' Flushes full buffer (including Row 24) and redraws cover art
                                         g_LastActiveLyric = -2
                                         
                                 ENDSELECT
@@ -4648,25 +4732,39 @@ WHILE argIdx < g_TrackCount
                                 CASE 0
                                     SELECT g_Shuffle
                                         CASE 1
-                                            ' Random Unplayed Pick
-                                            INT unplayedTarget = INT(RND(g_TrackCount - g_PlayedCount)) + 1
-                                            INT currentUnplayed = 0, scanIdx = 0
+                                            ' 1. Queue full check
+                                            IF g_PlayedCount >= g_TrackCount THEN
+                                                argIdx = g_TrackCount ' Triggers exit to CleanupExit
+                                            ELSE
+                                                ' 2. Select Nth unplayed track
+                                                INT unplayedTarget = INT(RND(g_TrackCount - g_PlayedCount)) + 1
+                                                INT currentUnplayed = 0
+                                                scanIdx = 0
+                                                INT foundIdx = -1
 
-                                            WHILE scanIdx < g_TrackCount
-                                                SELECT (LEN(g_Playlist[scanIdx]) > 0)
-                                                    CASE 1
-                                                        SELECT g_Played[scanIdx]
-                                                            CASE 0
-                                                                currentUnplayed = currentUnplayed + 1
-                                                                SELECT (currentUnplayed = unplayedTarget)
-                                                                    CASE 1
-                                                                        argIdx = scanIdx
-                                                                        scanIdx = g_TrackCount
-                                                                ENDSELECT
-                                                        ENDSELECT
-                                                ENDSELECT
-                                                scanIdx = scanIdx + 1
-                                            ENDWHILE
+                                                WHILE scanIdx < g_TrackCount
+                                                    IF LEN(g_Playlist[scanIdx]) > 0 THEN
+                                                        IF g_Played[scanIdx] = 0 THEN
+                                                            currentUnplayed = currentUnplayed + 1
+                                                            IF currentUnplayed = unplayedTarget THEN
+                                                                foundIdx = scanIdx
+                                                                scanIdx = g_TrackCount ' Exit loop
+                                                            ENDIF
+                                                        ENDIF
+                                                    ENDIF
+                                                    scanIdx = scanIdx + 1
+                                                ENDWHILE
+
+                                                ' 3. Assign target and immediately lock played state
+                                                IF foundIdx <> -1 THEN
+                                                    argIdx = foundIdx
+                                                    g_Played[argIdx] = 1
+                                                    g_PlayedCount = g_PlayedCount + 1
+                                                ELSE
+                                                    ' Safeguard: No unplayed item found -> Terminate queue
+                                                    argIdx = g_TrackCount
+                                                ENDIF
+                                            ENDIF
 
                                         CASE 0
                                             ' Linear Advance to Next Unplayed
