@@ -1,0 +1,108 @@
+===============================================================================
+               CPLAY2 - AUDIO DSP & LISTENING SYNERGY GUIDE
+===============================================================================
+
+CPLAY2 includes a 7-module native 16-bit PCM audio processing chain built on
+top of the BASS audio engine. Because DSP modules process audio sequentially,
+understanding how each filter affects the stereo image and dynamic range helps
+you achieve the optimal listening profile for your specific equipment.
+
+-------------------------------------------------------------------------------
+1. DSP MODULE OVERVIEW
+-------------------------------------------------------------------------------
+
+[1] Master 10-Band EQ
+    - Function: Precision frequency adjustment across 10 fixed ISO bands
+      (31 Hz to 16 kHz) with automatic safety precut headroom to prevent
+      digital clipping.
+    - Best For: Compensating for headphone sound signatures or acoustic
+      room nodes.
+
+[2] Volume Normalization (AGC w/ Exponential Smoothing)
+    - Function: Evaluates block peak amplitude and applies dual-rate exponential
+      moving averages (fast attack, slow release) to match target loudness
+      across mixed tracks without "pumping" or volume jitter.
+    - Best For: Multi-artist playlists, shuffle mode, and classical or live
+      track compilations.
+
+[3] Dynamic Compressor
+    - Function: Narrower peak-to-average ratio reduction to keep soft nuances
+      audible while taming sudden volume peaks.
+    - Best For: High-dynamic-range classical or orchestral recordings in
+      noisy listening environments.
+
+[4] Acoustic Decay (Reverb)
+    - Function: Simulates natural room/hall boundary reflections and tail decay.
+    - Best For: Adding spatial depth to dry studio recordings or compensating
+      for non-sealing flathead earbuds.
+
+[5] Vacuum Tube Warmth
+    - Function: Introduces gentle 2nd-order harmonic distortion and subtle
+      high-frequency rounding.
+    - Best For: Smoothing out harsh treble on sharp In-Ear Monitors (IEMs)
+      or aggressive digital remasters.
+
+[6] Stereo 3D Widener
+    - Function: Extracts and amplifies the Mid/Side (L - R) difference signal
+      to push the soundstage beyond the ear drivers.
+    - Best For: Overcoming the narrow "inside-the-head" imaging characteristic
+      of isolated IEMs and closed-back headphones.
+
+[7] Headphone Crossfeed (Bauer Filter)
+    - Function: Blends ~30% of attenuated, low-pass delayed audio (~220us) into
+      the opposite channel to emulate speaker listening in room acoustics.
+    - Best For: Reducing listener fatigue on hard-panned stereo recordings
+      (e.g., 1960s stereo mixes) during extended headphone sessions.
+
+
+-------------------------------------------------------------------------------
+2. RECOMMENDED DSP COMBINATIONS
+-------------------------------------------------------------------------------
+
+PROFILE A: Deep Isolation In-Ear Monitors (IEMs)
+Goal: Round off harsh upper-mids, expand narrow soundstage isolation, and keep
+      dynamics smooth.
+  - [ON]  Vacuum Tube Warmth
+  - [ON]  Stereo 3D Widener
+  - [ON]  Volume Normalization (AGC)
+  - [OFF] Headphone Crossfeed
+  - [OFF] Acoustic Decay
+
+PROFILE B: Open / Flathead Earbuds (Classical & Live Tracks)
+Goal: Add ambient hall body, compensate for open seal bass roll-off, and level
+      classical dynamics.
+  - [ON]  Acoustic Decay (Reverb)
+  - [ON]  Master 10-Band EQ (Moderate bass shelf)
+  - [ON]  Volume Normalization (AGC)
+  - [OFF] Stereo 3D Widener
+  - [OFF] Headphone Crossfeed
+
+PROFILE C: Vintage / Hard-Panned Stereo Headphone Listening
+Goal: Eliminate ear fatigue caused by extreme Left/Right panning on headphones.
+  - [ON]  Headphone Crossfeed
+  - [ON]  Master 10-Band EQ
+  - [OFF] Stereo 3D Widener
+  - [OFF] Acoustic Decay
+
+
+-------------------------------------------------------------------------------
+3. INCOMPATIBLE DSP COMBINATIONS (WHAT TO AVOID)
+-------------------------------------------------------------------------------
+
+[X] Stereo 3D Widener + Headphone Crossfeed
+    - Why: They actively counteract each other. The Widener boosts the
+      Mid/Side difference signal to pull channels apart, while Crossfeed
+      feeds channel signal into the opposite ear to narrow spatial separation.
+      Combining them causes phase cancellation, hollow mids, and unnatural
+      soundstaging.
+
+[X] Acoustic Decay + Headphone Crossfeed
+    - Why: Delayed room reflections get cross-fed back into the opposite
+      channel, resulting in a smeared, muddy mid-bass response.
+
+[X] Volume Normalization (AGC) + Dynamic Compressor (at extreme settings)
+    - Why: Both attempt to control dynamic range simultaneously. Running
+      aggressive compression into AGC can flatten the natural transient
+      dynamics of acoustic instruments.
+
+===============================================================================
