@@ -1,0 +1,6 @@
+*.iwb linguist-language=BASIC
+*.inc linguist-language=BASIC
+# Exclude include files or vendor libs from language stats
+*.html linguist-vendored
+*.inc linguist-vendored
+lib/* linguist-vendored
