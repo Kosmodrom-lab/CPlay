@@ -32,7 +32,7 @@ CONST NormalizationC = 1
 CONST CP_OEMCP = 1
 CONST CP_UTF8  = 65001
 CONST MB_ERR_INVALID_CHARS = 8
-CONST MARQUEE_SPEED_DIV = 150  ' 150 frames * 50ms = 7500ms per character step
+CONST MARQUEE_SPEED_DIV = 150  ' 150 frames * 5ms = 750ms per character step
 
 ' ----------------------------------------------------------------------------
 ' BASS Constants & Types
@@ -206,7 +206,7 @@ INT g_MoreFocus   = 0   ' Focused row index (0 to 4)
 
 ' 10 Bands EQ Listbox Coordinates on hOptionsBuffer
 CONST EQ_FORM_X = 42
-CONST EQ_FORM_Y = 9
+CONST EQ_FORM_Y = 10
 
 ' --- 10-Band Graphic EQ Globals ---
 DOUBLE g_EqFreqs[10]
@@ -229,6 +229,28 @@ INT g_TubeEnabled     = 0
 DWORD g_hTubeDSP      = 0
 INT g_WidenerEnabled  = 0
 DWORD g_hWidenerDSP   = 0
+
+' --- Crossfeed Filter Globals (Headphone Listening) ---
+INT   g_CrossfeedEnabled = 0
+DWORD g_hCrossfeedDSP    = 0
+
+' Delay line ring buffer for low-pass cross-channel blending (16-bit stereo)
+INT g_XFeedHistL[16]
+INT g_XFeedHistR[16]
+INT g_XFeedIdx = 0
+
+' --- AGC Exponential Smoothing Globals ---
+INT    g_AgcEnabled       = 0
+INT g_AgcResetOnNextApply = 1
+DWORD  g_hAgcDSP          = 0
+DOUBLE g_AgcCurrentGain   = 1.0     ' Current smoothed gain applied to audio
+DOUBLE g_AgcTargetVolume  = 22000.0 ' Target peak amplitude (~-3.5 dBFS)
+
+' Alpha coefficients for 44.1kHz buffer blocks
+' Attack = Fast gain reduction (~50ms) to stop clipping
+' Release = Slow gain swell (~2.5s) to preserve dynamics
+DOUBLE g_AgcAlphaAttack  = 0.15
+DOUBLE g_AgcAlphaRelease = 0.005
 
 ' Options Screen 1 Navigation
 INT g_DspSelectedIndex = 0  ' Focused row in DSP Listbox (0 to 5)
@@ -505,19 +527,20 @@ SUB DrawOptionsScreen()
        PRINT "  Audio DSP Modules  "
     ENDIF
 
-    STRING dspNames[6]
-    INT dspStates[6]
-    dspNames[0] = "Master 10-Band EQ"  : dspStates[0] = g_EqEnabled
-    dspNames[1] = "Volume Normalization": dspStates[1] = g_NormEnabled
-    dspNames[2] = "Dynamic Compressor"  : dspStates[2] = g_CompEnabled
+    STRING dspNames[7]
+    INT dspStates[7]
+    dspNames[0] = "Master 10-Band EQ"     : dspStates[0] = g_EqEnabled
+    dspNames[1] = "Volume Normalization"   : dspStates[1] = g_NormEnabled
+    dspNames[2] = "Dynamic Compressor"     : dspStates[2] = g_CompEnabled
     dspNames[3] = "Acoustic Decay (Reverb)": dspStates[3] = g_ReverbEnabled
-    dspNames[4] = "Vacuum Tube Warmth"  : dspStates[4] = g_TubeEnabled
-    dspNames[5] = "Stereo 3D Widener"   : dspStates[5] = g_WidenerEnabled
+    dspNames[4] = "Vacuum Tube Warmth"     : dspStates[4] = g_TubeEnabled
+    dspNames[5] = "Stereo 3D Widener"      : dspStates[5] = g_WidenerEnabled
+    dspNames[6] = "Headphone Crossfeed"    : dspStates[6] = g_CrossfeedEnabled
 
     INT i, rowY, isSel
     STRING statusStr, rowText
 
-    FOR i = 0 TO 5
+    FOR i = 0 TO 6
         rowY = 2 + i
         SetConsolePos(2, rowY)
         isSel = (i = g_DspSelectedIndex)
@@ -541,14 +564,14 @@ SUB DrawOptionsScreen()
     ' ========================================================================
     ' 2. BOTTOM-LEFT LISTBOX: PRESET SELECTION (g_OptionsFocus = 1)
     ' ========================================================================
-    SetConsolePos(2, 9)
+    SetConsolePos(2, 10)
     IF g_OptionsFocus = 1
       SetColor(C_YELLOW) : PRINT "[ Presets in .\\EQ\\ ]"
     ELSE
       SetColor(C_WHITE) : PRINT "  Presets in .\\EQ\\  "
     ENDIF
 
-    INT visibleCount = 10
+    INT visibleCount = 9
     INT startIdx = 0
     IF g_EqSelectedIndex >= visibleCount THEN startIdx = g_EqSelectedIndex - visibleCount + 1
 
@@ -557,7 +580,7 @@ SUB DrawOptionsScreen()
 
     FOR i = 0 TO visibleCount - 1
         itemIdx = startIdx + i
-        rowY = 10 + i
+        rowY = 11 + i
         SetConsolePos(2, rowY)
         
         IF itemIdx < g_EqFileCount THEN
@@ -800,19 +823,42 @@ ENDSUB
 
 SUB UpdateStreamVolume(DWORD hStreamHandle)
     IF hStreamHandle = 0 THEN RETURN
+
     INT curFreq, curVol, curPan
     BASS_ChannelGetAttributes(hStreamHandle, &curFreq, &curVol, &curPan)
-    
+
     DOUBLE effVol = g_Volume
+
+    ' 1. Apply Safety Precut Headroom for Boosted EQ Bands
     IF g_EqEnabled = 1 AND g_EqPrecut < 0.0 THEN
         DOUBLE scaleFactor = 10.0 ^ (g_EqPrecut / 20.0)
-        effVol = g_Volume * scaleFactor
+        effVol = effVol * scaleFactor
     ENDIF
-    
+
+    ' 2. Apply Dynamic Normalization Boost / Attenuation
+    IF g_NormEnabled = 1 THEN
+        DWORD level = BASS_ChannelGetLevel(hStreamHandle)
+        IF level <> -1 AND level > 0 THEN
+            INT leftPeak  = level & 0xFFFF
+            INT rightPeak = (level / 65536) & 0xFFFF
+            INT maxPeak   = leftPeak
+            IF rightPeak > maxPeak THEN maxPeak = rightPeak
+
+            ' Calculate target headroom relative to full 16-bit scale (32768)
+            IF maxPeak > 1000 THEN
+                DOUBLE peakRatio = 28000.0 / maxPeak ' Target ~85% peak output
+                IF peakRatio > 2.0 THEN peakRatio = 2.0 ' Limit max gain boost to +6 dB
+                IF peakRatio < 0.5 THEN peakRatio = 0.5 ' Limit max attenuation to -6 dB
+
+                effVol = effVol * peakRatio
+            ENDIF
+        ENDIF
+    ENDIF
+
     INT finalVol = INT(effVol)
     IF finalVol < 0 THEN finalVol = 0
     IF finalVol > 100 THEN finalVol = 100
-    
+
     BASS_ChannelSetAttributes(hStreamHandle, curFreq, finalVol, curPan)
 ENDSUB
 
@@ -1108,6 +1154,7 @@ SUB TubeWarmthDSP(DWORD hDSP, DWORD channel, POINTER pBuffer, DWORD length, DWOR
     DOUBLE x, y
 
     FOR i = 0 TO sampleCount - 1
+        ' Read 16-bit sample via IWBasic pointer dereference
         sVal = #<WORD>pSamples[i]
         IF sVal > 32767 THEN sVal = sVal - 65536
 
@@ -1115,13 +1162,15 @@ SUB TubeWarmthDSP(DWORD hDSP, DWORD channel, POINTER pBuffer, DWORD length, DWOR
         IF x > 1.0 THEN x = 1.0
         IF x < -1.0 THEN x = -1.0
 
-        ' Non-linear saturation curve: y = 1.5 * (x - x^3 / 3)
+        ' Non-linear cubic saturation curve: y = 1.5 * (x - x^3 / 3)
         y = 1.5 * (x - (x * x * x) / 3.0)
 
         sVal = INT(y * 32767.0)
         IF sVal > 32767 THEN sVal = 32767
         IF sVal < -32768 THEN sVal = -32768
 
+        ' Convert back to unsigned 16-bit WORD representation for memory write
+        IF sVal < 0 THEN sVal = sVal + 65536
         #<WORD>pSamples[i] = sVal
     NEXT i
 ENDSUB
@@ -1133,8 +1182,11 @@ SUB StereoWidenerDSP(DWORD hDSP, DWORD channel, POINTER pBuffer, DWORD length, D
     POINTER pSamples = pBuffer
 
     FOR i = 0 TO frameCount - 1
+        ' Left Channel
         lVal = #<WORD>pSamples[i * 2]
         IF lVal > 32767 THEN lVal = lVal - 65536
+
+        ' Right Channel
         rVal = #<WORD>pSamples[i * 2 + 1]
         IF rVal > 32767 THEN rVal = rVal - 65536
 
@@ -1144,13 +1196,136 @@ SUB StereoWidenerDSP(DWORD hDSP, DWORD channel, POINTER pBuffer, DWORD length, D
         lOut = midVal + sideVal
         rOut = midVal - sideVal
 
+        ' Hard clipping bounds
         IF lOut > 32767 THEN lOut = 32767
         IF lOut < -32768 THEN lOut = -32768
         IF rOut > 32767 THEN rOut = 32767
         IF rOut < -32768 THEN rOut = -32768
 
+        ' Convert negative values back to WORD unsigned memory layout
+        IF lOut < 0 THEN lOut = lOut + 65536
+        IF rOut < 0 THEN rOut = rOut + 65536
+
         #<WORD>pSamples[i * 2]     = lOut
         #<WORD>pSamples[i * 2 + 1] = rOut
+    NEXT i
+ENDSUB
+
+' 3. Crossfeed DSP
+SUB CrossfeedDSP(DWORD hDSP, DWORD channel, POINTER pBuffer, DWORD length, DWORD user)
+    INT frameCount = length / 4 ' 16-bit stereo = 4 bytes per frame (2L + 2R)
+    INT i, lVal, rVal, lCross, rCross, lOut, rOut
+    POINTER pSamples = pBuffer
+
+    FOR i = 0 TO frameCount - 1
+        ' Read 16-bit samples via IWBasic pointer dereference
+        lVal = #<WORD>pSamples[i * 2]
+        IF lVal > 32767 THEN lVal = lVal - 65536
+
+        rVal = #<WORD>pSamples[i * 2 + 1]
+        IF rVal > 32767 THEN rVal = rVal - 65536
+
+        ' Store current samples in delay history
+        g_XFeedHistL[g_XFeedIdx] = lVal
+        g_XFeedHistR[g_XFeedIdx] = rVal
+        
+        ' Retrieve delayed cross-channel sample (~10 samples back @ 44.1kHz = ~226µs)
+        INT delayIdx = (g_XFeedIdx + 6) % 16
+        INT lDelayed = g_XFeedHistL[delayIdx]
+        INT rDelayed = g_XFeedHistR[delayIdx]
+
+        ' Crossfeed attenuation (~30% blend + simple low-pass smoothing)
+        rCross = INT(lDelayed * 0.30)
+        lCross = INT(rDelayed * 0.30)
+
+        ' Direct channel attenuation (~90%) + crossfeed addition
+        lOut = INT(lVal * 0.88) + lCross
+        rOut = INT(rVal * 0.88) + rCross
+
+        ' Hard clipping bounds
+        IF lOut > 32767 THEN lOut = 32767
+        IF lOut < -32768 THEN lOut = -32768
+        IF rOut > 32767 THEN rOut = 32767
+        IF rOut < -32768 THEN rOut = -32768
+
+        ' Convert negative values back to WORD unsigned memory layout
+        IF lOut < 0 THEN lOut = lOut + 65536
+        IF rOut < 0 THEN rOut = rOut + 65536
+
+        #<WORD>pSamples[i * 2]     = lOut
+        #<WORD>pSamples[i * 2 + 1] = rOut
+
+        g_XFeedIdx = (g_XFeedIdx + 1) % 16
+    NEXT i
+ENDSUB
+
+' 4. Automatic Gain Control (AGC) Exponential Smoothing
+SUB AgcSmoothedDSP(DWORD hDSP, DWORD channel, POINTER pBuffer, DWORD length, DWORD user)
+    INT frameCount = length / 4 ' 16-bit stereo = 4 bytes per frame
+    INT i, lVal, rVal, maxPeak, absL, absR
+    DOUBLE blockPeak, targetGain, alpha, sampleGain
+    POINTER pSamples = pBuffer
+
+    maxPeak = 0
+
+    ' 1. Pass 1: Find the absolute peak amplitude in this buffer block
+    FOR i = 0 TO frameCount - 1
+        lVal = #<WORD>pSamples[i * 2]
+        IF lVal > 32767 THEN lVal = lVal - 65536
+        absL = ABS(lVal)
+
+        rVal = #<WORD>pSamples[i * 2 + 1]
+        IF rVal > 32767 THEN rVal = rVal - 65536
+        absR = ABS(rVal)
+
+        IF absL > maxPeak THEN maxPeak = absL
+        IF absR > maxPeak THEN maxPeak = absR
+    NEXT i
+
+    ' Prevent divide-by-zero on total silence
+    IF maxPeak < 100 THEN maxPeak = 100
+    blockPeak = maxPeak * 1.0
+
+    ' 2. Calculate ideal target gain for this block
+    targetGain = g_AgcTargetVolume / blockPeak
+
+    ' Limit target gain bounds (Don't boost low noise floor above 2.0x, don't attenuate below 0.2x)
+    IF targetGain > 2.0 THEN targetGain = 2.0
+    IF targetGain < 0.2 THEN targetGain = 0.2
+
+    ' 3. Select smoothing rate: Attack (gain decreasing) vs. Release (gain increasing)
+    IF targetGain < g_AgcCurrentGain THEN
+        alpha = g_AgcAlphaAttack
+    ELSE
+        alpha = g_AgcAlphaRelease
+    ENDIF
+
+    ' 4. Apply Exponential Moving Average (EMA)
+    g_AgcCurrentGain = (alpha * targetGain) + ((1.0 - alpha) * g_AgcCurrentGain)
+
+    ' 5. Pass 2: Apply smoothed gain to 16-bit PCM samples
+    sampleGain = g_AgcCurrentGain
+    FOR i = 0 TO frameCount - 1
+        lVal = #<WORD>pSamples[i * 2]
+        IF lVal > 32767 THEN lVal = lVal - 65536
+
+        rVal = #<WORD>pSamples[i * 2 + 1]
+        IF rVal > 32767 THEN rVal = rVal - 65536
+
+        lVal = INT(lVal * sampleGain)
+        rVal = INT(rVal * sampleGain)
+
+        ' Hard clipping prevention
+        IF lVal > 32767 THEN lVal = 32767
+        IF lVal < -32768 THEN lVal = -32768
+        IF rVal > 32767 THEN rVal = 32767
+        IF rVal < -32768 THEN rVal = -32768
+
+        IF lVal < 0 THEN lVal = lVal + 65536
+        IF rVal < 0 THEN rVal = rVal + 65536
+
+        #<WORD>pSamples[i * 2]     = lVal
+        #<WORD>pSamples[i * 2 + 1] = rVal
     NEXT i
 ENDSUB
 
@@ -1174,6 +1349,37 @@ SUB ApplyStereoWidener(DWORD hStreamHandle)
     ENDIF
     IF g_WidenerEnabled = 1 THEN
         g_hWidenerDSP = BASS_ChannelSetDSP(hStreamHandle, &StereoWidenerDSP, 0, 0)
+    ENDIF
+ENDSUB
+
+SUB ApplyCrossfeed(DWORD hStreamHandle)
+    IF hStreamHandle = 0 THEN RETURN
+    IF g_hCrossfeedDSP <> 0 THEN
+        BASS_ChannelRemoveDSP(hStreamHandle, g_hCrossfeedDSP)
+        g_hCrossfeedDSP = 0
+    ENDIF
+    IF g_CrossfeedEnabled = 1 THEN
+        ' Reset history buffers
+        RtlZeroMemory(&g_XFeedHistL[0], 64)
+        RtlZeroMemory(&g_XFeedHistR[0], 64)
+        g_XFeedIdx = 0
+        g_hCrossfeedDSP = BASS_ChannelSetDSP(hStreamHandle, &CrossfeedDSP, 0, 0)
+    ENDIF
+ENDSUB
+
+SUB ApplyAgcSmoothed(DWORD hStreamHandle)
+    IF hStreamHandle = 0 THEN RETURN
+    IF g_hAgcDSP <> 0 THEN
+        BASS_ChannelRemoveDSP(hStreamHandle, g_hAgcDSP)
+        g_hAgcDSP = 0
+    ENDIF
+    IF g_NormEnabled = 1 THEN
+        ' Only reset smoothing to unity gain when a new track starts
+        IF g_AgcResetOnNextApply = 1 THEN
+            g_AgcCurrentGain = 1.0
+            g_AgcResetOnNextApply = 0
+        ENDIF
+        g_hAgcDSP = BASS_ChannelSetDSP(hStreamHandle, &AgcSmoothedDSP, 0, 0)
     ENDIF
 ENDSUB
 
@@ -1224,10 +1430,12 @@ ENDSUB
 ' Updated Master DSP Dispatcher
 SUB ApplyAllDSP(DWORD hStreamHandle)
     ApplyEqProfile(hStreamHandle)
+    ApplyAgcSmoothed(hStreamHandle)
     ApplyCompressor(hStreamHandle)
     ApplyReverb(hStreamHandle)
     ApplyTubeWarmth(hStreamHandle)
     ApplyStereoWidener(hStreamHandle)
+    ApplyCrossfeed(hStreamHandle)
 ENDSUB
 
 SUB EnsureDefaultEQProfiles()
@@ -2249,7 +2457,7 @@ SUB DrawEqNumericForm()
     freqLabels[8] = "  8 kHz"
     freqLabels[9] = " 16 kHz"
 
-    ' Form Header
+    ' Form Header (Now rendered at Row 10)
     SetConsolePos(EQ_FORM_X, EQ_FORM_Y)
     IF g_OptionsFocus = 2 THEN
         SetColor(C_YELLOW)
@@ -2273,7 +2481,7 @@ SUB DrawEqNumericForm()
         ENDIF
         PRINT labelStr
 
-        ' 2. Deterministic Fixed-Width Value Formatting (Exactly 8 chars)
+        ' 2. Fixed-Width Value Formatting
         SetConsolePos(EQ_FORM_X + 22, rowY)
         gVal = g_EqGains[band]
 
@@ -2285,7 +2493,6 @@ SUB DrawEqNumericForm()
             signStr = " "
         ENDIF
 
-        ' Convert to tenths integer to eliminate float formatting artifacts
         iG = INT(ABS(gVal) * 10.0 + 0.5)
         whole = iG / 10
         frac  = iG % 10
@@ -2299,7 +2506,6 @@ SUB DrawEqNumericForm()
         onesStr = LTRIM$(STR$(whole % 10))
         fracStr = LTRIM$(STR$(frac))
 
-        ' Assembles strict 8-character string: "+10.5 dB", "+ 1.5 dB", "  0.0 dB", "- 0.5 dB"
         valStr = signStr + tensStr + onesStr + "." + fracStr + " dB"
 
         ' Set Text Colors
@@ -2764,6 +2970,8 @@ SUB LoadConfig()
                         IF valNum = 0 OR valNum = 1 THEN g_TubeEnabled = valNum
                     CASE "widener_enabled"
                         IF valNum = 0 OR valNum = 1 THEN g_WidenerEnabled = valNum
+                    CASE "crossfeed_enabled"
+                        IF valNum = 0 OR valNum = 1 THEN g_CrossfeedEnabled = valNum
                     CASE "balance"
                         g_Balance = valNum
                     CASE "mono_downmix"
@@ -2805,6 +3013,7 @@ SUB SaveConfig()
         WRITE hF, "reverb_enabled=" + LTRIM$(STR$(g_ReverbEnabled))
         WRITE hF, "tube_enabled=" + LTRIM$(STR$(g_TubeEnabled))
         WRITE hF, "widener_enabled=" + LTRIM$(STR$(g_WidenerEnabled))
+        WRITE hF, "crossfeed_enabled=" + LTRIM$(STR$(g_CrossfeedEnabled))
         WRITE hF, "balance=" + LTRIM$(STR$(g_Balance))
         WRITE hF, "mono_downmix=" + LTRIM$(STR$(g_MonoDownmix))
         WRITE hF, "gapless=" + LTRIM$(STR$(g_Gapless))
@@ -3853,26 +4062,10 @@ WHILE argIdx < g_TrackCount
 
     pTrack = g_Playlist[argIdx]
 
-    ' 1. Create stream with Mono Downmix & Prescan support
+    ' 1. Create stream FIRST
     hStream = CreateTrackStream(g_Playlist[argIdx])
 
-    ' 2. Pause playback immediately
-    BASS_ChannelPause(hStream)
-
-    ' 3. Request BASS to prebuffer the stream (e.g. 1000ms to 2000ms)
-    BASS_ChannelPreBuf(hStream, 1000)
-
-    ' Restore byte position if Resume Position is active
-    IF g_ResumePos = 1 AND g_LastTrackPos > 0q AND hStream <> 0 THEN
-        QWORD trackBytes = BASS_ChannelGetLength(hStream)
-        IF g_LastTrackPos < trackBytes THEN
-            BASS_ChannelSetPosition(hStream, g_LastTrackPos)
-        ENDIF
-        ' Clear so subsequent tracks start from beginning
-        g_LastTrackPos = 0q
-    ENDIF
-
-
+    ' 2. Check stream creation success/failure
     IF hStream = 0 THEN
         INT finalErr = BASS_ErrorGetCode()
         Trace("  -> CRITICAL: BASS_StreamCreateFile FAILED -> Error Code: " + LTRIM$(STR$(finalErr)))
@@ -3882,34 +4075,42 @@ WHILE argIdx < g_TrackCount
         SetColor(colStatic)
         Sleep(1200)
     ELSE
-        ' Trace("  -> Stream created successfully via CreateTrackStream. Handle: " + LTRIM$(STR$(hStream)))
-        ' Fetch active channel attributes & synchronize volume
+        ' 3. Pause playback immediately
+        BASS_ChannelPause(hStream)
+
+        ' 4. Restore byte position if Resume Position is active
+        IF g_ResumePos = 1 AND g_LastTrackPos > 0q THEN
+            QWORD trackBytes = BASS_ChannelGetLength(hStream)
+            IF g_LastTrackPos < trackBytes THEN
+                BASS_ChannelSetPosition(hStream, g_LastTrackPos)
+            ENDIF
+            ' Clear so subsequent tracks start from the beginning
+            g_LastTrackPos = 0q
+        ENDIF
+
+        ' 5. Load track metadata & lyrics
+        LoadTrackMetadata(hStream, argIdx)
+
+        ' 6. Apply active DSP modules (EQ, AGC, Reverb, Tube, Widener, Crossfeed)
+        ApplyAllDSP(hStream)
+
+        ' 7. Synchronize volume attributes
         INT curFreq, curVol, curPan
         BASS_ChannelGetAttributes(hStream, &curFreq, &curVol, &curPan)
         UpdateStreamVolume(hStream)
 
-        ' Apply all active DSP modules (EQ, Compressor, Reverb)
-        ApplyAllDSP(hStream)
+        ' 8. Request BASS to prebuffer stream LAST (populates buffer at the resumed seek position with active DSP)
+        BASS_ChannelPreBuf(hStream, 2000)
 
-        ' Load initial track metadata
-        LoadTrackMetadata(hStream, argIdx)
-
+        ' 9. Update stats & interface counters
         IF g_Played[argIdx] = 0 THEN
             g_Played[argIdx] = 1
             g_PlayedCount = g_PlayedCount + 1
         ENDIF
-/*
-        ' Populate previous track title for resumed sessions
-        IF (g_LastPlayedTitle = "None" OR g_LastPlayedTitle = "") AND argIdx > 0 THEN
-            IF g_Playlist[argIdx - 1] <> "" THEN
-                g_LastPlayedTitle = ConvertANSItoOEM(EnsureANSI(GetFileNameOnly(g_Playlist[argIdx - 1])))
-            ENDIF
-        ENDIF
-*/
 
         marqueeTick = 0 : marqueeOffset = 0
 
-        ' Initial HUD View Routing (Fully Buffer-Blitted)
+        ' 10. Initial HUD View Routing
         SELECT g_InOptionsView
             CASE 0
                 BufClear(C_BLACK)
@@ -4387,7 +4588,7 @@ WHILE argIdx < g_TrackCount
                                         IF (GetAsyncKeyState(0x28) & 0x8000) <> 0 THEN ' DOWN
                                             IF optDownDown = 0 THEN
                                                 optDownDown = 1
-                                                IF g_DspSelectedIndex < 5 THEN
+                                                IF g_DspSelectedIndex < 6 THEN ' Updated bound to reach 7th item (Index 6)
                                                     g_DspSelectedIndex = g_DspSelectedIndex + 1
                                                     DrawOptionsScreen()
                                                 ENDIF
@@ -4504,12 +4705,13 @@ WHILE argIdx < g_TrackCount
                                         CASE " " ' Spacebar Toggles focused module in Panel 0
                                             IF g_OptionsFocus = 0 THEN
                                                 SELECT g_DspSelectedIndex
-                                                    CASE 0 : g_EqEnabled      = 1 - g_EqEnabled      : ApplyEqProfile(hStream)
-                                                    CASE 1 : g_NormEnabled    = 1 - g_NormEnabled    : UpdateStreamVolume(hStream)
-                                                    CASE 2 : g_CompEnabled    = 1 - g_CompEnabled    : ApplyCompressor(hStream)
-                                                    CASE 3 : g_ReverbEnabled  = 1 - g_ReverbEnabled  : ApplyReverb(hStream)
-                                                    CASE 4 : g_TubeEnabled    = 1 - g_TubeEnabled    : ApplyTubeWarmth(hStream)
-                                                    CASE 5 : g_WidenerEnabled = 1 - g_WidenerEnabled : ApplyStereoWidener(hStream)
+                                                    CASE 0 : g_EqEnabled        = 1 - g_EqEnabled        : ApplyEqProfile(hStream)
+                                                    CASE 1 : g_NormEnabled      = 1 - g_NormEnabled      : UpdateStreamVolume(hStream)
+                                                    CASE 2 : g_CompEnabled      = 1 - g_CompEnabled      : ApplyCompressor(hStream)
+                                                    CASE 3 : g_ReverbEnabled    = 1 - g_ReverbEnabled    : ApplyReverb(hStream)
+                                                    CASE 4 : g_TubeEnabled      = 1 - g_TubeEnabled      : ApplyTubeWarmth(hStream)
+                                                    CASE 5 : g_WidenerEnabled   = 1 - g_WidenerEnabled   : ApplyStereoWidener(hStream)
+                                                    CASE 6 : g_CrossfeedEnabled = 1 - g_CrossfeedEnabled : ApplyCrossfeed(hStream)
                                                 ENDSELECT
                                                 SaveConfig()
                                                 DrawOptionsScreen()
@@ -4640,6 +4842,10 @@ WHILE argIdx < g_TrackCount
 
             ENDSELECT
 
+            ' Volume Normalization
+            IF g_NormEnabled = 1 AND (marqueeTick % 5 = 0) THEN
+               UpdateStreamVolume(hStream)
+            ENDIF
             ' Pass addresses via & to allow in-place handle swapping
             CheckStreamTransition(&hStream, &argIdx)
 
