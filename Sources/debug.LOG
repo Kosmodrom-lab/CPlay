@@ -1,0 +1,37 @@
+00000000	0.00000000	[21416] [CPlay Trace] CreateTrackStream: Attempting to create stream for: E:\MUSIC\RADIO\NOVA\LBN\LBN-1968\02 Count Matchuki - Movements.mp3 	
+00000001	0.00003150	[21416] [CPlay Trace]   Calling BASS_StreamCreateFile... 	
+00000002	0.45927721	[21416] [CPlay Trace]   Stream Handle: -1342177273 | BASS_ErrorGetCode(): 0 	
+00000003	170.87733459	[21416] [CPlay Trace] CreateTrackStream: Attempting to create stream for: E:\MUSIC\RADIO\NOVA\LBN\LBN-1970\02 Ananda Shankar - Jumpin' Jack Flash.mp3 	
+00000004	170.87736511	[21416] [CPlay Trace]   Calling BASS_StreamCreateFile... 	
+00000005	170.88195801	[21416] [CPlay Trace]   Stream Handle: -1342177267 | BASS_ErrorGetCode(): 0 	
+00000006	221.50993347	[13688] [CPlay Trace] EnumerateAudioDevices: Starting scan... 	
+00000007	221.51736450	[13688] [CPlay Trace]   [Slot 1] BASS DevID 1: Speakers / HP (IDT High Definition Audio CODEC) 	
+00000008	221.51742554	[13688] [CPlay Trace]   [Slot 2] BASS DevID 2: Speakers (FiiO Q series) 	
+00000009	221.51747131	[13688] [CPlay Trace] EnumerateAudioDevices: Total enumerated = 3 	
+00000010	221.51797485	[13688] [CPlay Trace] InitAudioEngine: Entering. g_SelectedDevice = 2 | g_AudioDeviceCount = 3 	
+00000011	221.51802063	[13688] [CPlay Trace]   HWNDs -> Console: 2429812 | Desktop: 65552 	
+00000012	221.51802063	[13688] [CPlay Trace]   Calling BASS_Free()... 	
+00000013	221.51806641	[13688] [CPlay Trace]   Resolved targetDevice BASS ID = 2 	
+00000014	221.51808167	[13688] [CPlay Trace]   Attempt 1: BASS_Init(device=2, freq=44100, flags=8, win=2429812) 	
+00000015	222.50556946	[13688] [CPlay Trace]   Attempt 1 Result: 1 | BASS_ErrorGetCode(): 0 	
+00000016	222.50561523	[13688] [CPlay Trace] InitAudioEngine: Final Return = 1 	
+00000017	222.50566101	[13688] [CPlay Trace] CreateTrackStream: Attempting to create stream for: E:\MUSIC\RADIO\NOVA\LBN\LBN-1970\02 Ananda Shankar - Jumpin' Jack Flash.mp3 	
+00000018	222.50575256	[13688] [CPlay Trace]   Calling BASS_StreamCreateFile... 	
+00000019	222.51029968	[13688] [CPlay Trace]   Stream Handle: -1342177279 | BASS_ErrorGetCode(): 0 	
+00000020	230.94882202	[13688] [CPlay Trace] SwitchAudioOutputDevice: Switching to ListIdx 1 (BASS DevID 1) 	
+00000021	231.85671997	[13688] [CPlay Trace] CreateTrackStream: Attempting to create stream for: E:\MUSIC\RADIO\NOVA\LBN\LBN-1970\02 Ananda Shankar - Jumpin' Jack Flash.mp3 	
+00000022	231.85673523	[13688] [CPlay Trace]   Calling BASS_StreamCreateFile... 	
+00000023	231.86160278	[13688] [CPlay Trace]   Stream Handle: -1342177273 | BASS_ErrorGetCode(): 0 	
+00000024	234.58180237	[13688] [CPlay Trace] SwitchAudioOutputDevice: Switching to ListIdx 0 (BASS DevID -1) 	
+00000025	234.58660889	[13688] [CPlay Trace]   Switch failed (Err 20). Falling back to Default Device. 	
+00000026	235.47981262	[13688] [CPlay Trace] CreateTrackStream: Attempting to create stream for: E:\MUSIC\RADIO\NOVA\LBN\LBN-1970\02 Ananda Shankar - Jumpin' Jack Flash.mp3 	
+00000027	235.47985840	[13688] [CPlay Trace]   Calling BASS_StreamCreateFile... 	
+00000028	235.48423767	[13688] [CPlay Trace]   Stream Handle: -1342177267 | BASS_ErrorGetCode(): 0 	
+00000029	245.15512085	[13688] [CPlay Trace] SwitchAudioOutputDevice: Switching to ListIdx 1 (BASS DevID 1) 	
+00000030	246.05107117	[13688] [CPlay Trace] CreateTrackStream: Attempting to create stream for: E:\MUSIC\RADIO\NOVA\LBN\LBN-1970\02 Ananda Shankar - Jumpin' Jack Flash.mp3 	
+00000031	246.05502319	[13688] [CPlay Trace]   Calling BASS_StreamCreateFile... 	
+00000032	246.05558777	[13688] [CPlay Trace]   Stream Handle: -1342177261 | BASS_ErrorGetCode(): 0 	
+00000033	247.94229126	[13688] [CPlay Trace] SwitchAudioOutputDevice: Switching to ListIdx 2 (BASS DevID 2) 	
+00000034	248.93218994	[13688] [CPlay Trace] CreateTrackStream: Attempting to create stream for: E:\MUSIC\RADIO\NOVA\LBN\LBN-1970\02 Ananda Shankar - Jumpin' Jack Flash.mp3 	
+00000035	248.93222046	[13688] [CPlay Trace]   Calling BASS_StreamCreateFile... 	
+00000036	248.93672180	[13688] [CPlay Trace]   Stream Handle: -1342177255 | BASS_ErrorGetCode(): 0 	

@@ -991,39 +991,31 @@ SUB CreateTrackStream(STRING filePath), DWORD
     DWORD flags = BASS_STREAM_PRESCAN | BASS_UNICODE
     IF g_MonoDownmix = 1 THEN flags = flags | BASS_SAMPLE_MONO
 
-    ' Trace("CreateTrackStream: File -> " + filePath)
+    Trace("CreateTrackStream: Attempting to create stream for: " + filePath)
 
     POINTER pWideTrack = GetWideString(filePath)
     DWORD newStream = 0
 
     IF LCASE$(RIGHT$(filePath, 5)) = ".flac" THEN
+        Trace("  Calling BASS_FLAC_StreamCreateFile...")
         newStream = BASS_FLAC_StreamCreateFile(0, pWideTrack, 0, 0, flags)
     ELSE
+        Trace("  Calling BASS_StreamCreateFile...")
         newStream = BASS_StreamCreateFile(0, pWideTrack, 0, 0, flags)
-        IF newStream = 0 THEN
-            INT err1 = BASS_ErrorGetCode()
-            ' Trace("CreateTrackStream: Primary attempt failed (BASS Err " + LTRIM$(STR$(err1)) + "). Retrying without prescan...")
-            newStream = BASS_StreamCreateFile(0, pWideTrack, 0, 0, BASS_UNICODE | (flags & BASS_SAMPLE_MONO))
-        ENDIF
     ENDIF
+
+    INT errCode = BASS_ErrorGetCode()
+    Trace("  Stream Handle: " + LTRIM$(STR$(newStream)) + " | BASS_ErrorGetCode(): " + LTRIM$(STR$(errCode)))
 
     IF pWideTrack <> 0 THEN DELETE pWideTrack
 
     IF newStream <> 0 THEN
-        ' Trace("CreateTrackStream: SUCCESS -> Stream Handle: " + LTRIM$(STR$(newStream)))
         ApplyAudioAttributes(newStream)
-
-        ' -r CLI flag active: Restore saved byte position from INI                
         IF g_isResumeMode = 1 AND g_LastTrackPos >= 1
            BASS_ChannelSetPosition(newStream, g_LastTrackPos)
         ELSE
-           ' Standard launch without -r: Force start from byte 0
            BASS_ChannelSetPosition(newStream, 0)
         ENDIF
-
-    ELSE
-        INT finalErr = BASS_ErrorGetCode()
-        ' Trace("CreateTrackStream: CRITICAL FAIL -> BASS Err Code: " + LTRIM$(STR$(finalErr)))
     ENDIF
 
     RETURN newStream
@@ -2850,50 +2842,85 @@ SUB ProcessArgument(STRING param)
 ENDSUB
 
 SUB EnumerateAudioDevices()
-    INT devIdx = 1  ' BASS device 0 is No Sound; 1+ are physical devices
+    INT devIdx = 1
     POINTER pDevName = 0
     g_AudioDeviceCount = 0
 
-    ' Slot 0 is reserved for Default System Output
     g_AudioDeviceList[0] = "Default System Device"
     g_AudioDeviceIDs[0]  = -1
     g_AudioDeviceCount   = 1
 
+    Trace("EnumerateAudioDevices: Starting scan...")
     pDevName = BASS_GetDeviceDescription(devIdx)
     WHILE pDevName <> 0 AND g_AudioDeviceCount < 16
         STRING dName = #<STRING>pDevName
         IF LEN(dName) > 0 THEN
             g_AudioDeviceList[g_AudioDeviceCount] = ConvertANSItoOEM(EnsureANSI(dName))
             g_AudioDeviceIDs[g_AudioDeviceCount]  = devIdx
+            Trace("  [Slot " + LTRIM$(STR$(g_AudioDeviceCount)) + "] BASS DevID " + LTRIM$(STR$(devIdx)) + ": " + dName)
             g_AudioDeviceCount = g_AudioDeviceCount + 1
         ENDIF
         devIdx = devIdx + 1
         pDevName = BASS_GetDeviceDescription(devIdx)
-    ENDWHILE
+    WEND
+    Trace("EnumerateAudioDevices: Total enumerated = " + LTRIM$(STR$(g_AudioDeviceCount)))
 ENDSUB
 
 SUB InitAudioEngine(), INT
     INT initResult = 0
     INT targetDevice = -1
+    UINT hConWnd = GetConsoleWindow()
+    UINT hDeskWnd = GetDesktopWindow()
 
-    ' Resolve device ID mapping
+    Trace("InitAudioEngine: Entering. g_SelectedDevice = " + LTRIM$(STR$(g_SelectedDevice)) + " | g_AudioDeviceCount = " + LTRIM$(STR$(g_AudioDeviceCount)))
+    Trace("  HWNDs -> Console: " + LTRIM$(STR$(hConWnd)) + " | Desktop: " + LTRIM$(STR$(hDeskWnd)))
+
+    Trace("  Calling BASS_Free()...")
+    BASS_Free()
+
     IF g_SelectedDevice >= 0 AND g_SelectedDevice < g_AudioDeviceCount THEN
         targetDevice = g_AudioDeviceIDs[g_SelectedDevice]
     ENDIF
+    Trace("  Resolved targetDevice BASS ID = " + LTRIM$(STR$(targetDevice)))
 
-    ' Optimized BASS Buffer Configurations
-    BASS_SetConfig(BASS_CONFIG_UPDATEPERIOD, 20)  ' 20ms update period for tighter timing
-    BASS_SetConfig(BASS_CONFIG_BUFFER, 2000)       ' 2000ms overall stream buffer
-    BASS_SetConfig(BASS_CONFIG_DEV_BUFFER, 100)    ' 100ms hardware device buffer headroom
+    BASS_SetConfig(BASS_CONFIG_UPDATEPERIOD, 20)
+    BASS_SetConfig(BASS_CONFIG_BUFFER, 3000)
+    BASS_SetConfig(BASS_CONFIG_DEV_BUFFER, 200)
 
-    ' Initialize target output device (fallback to default -1 if targeted initialization fails)
-    initResult = BASS_Init(targetDevice, 44100, BASS_DEVICE_DMIX, 0, 0)
-    IF initResult = 0 AND targetDevice <> -1 THEN
-        Trace("InitAudioEngine: Specific device init failed. Falling back to default device.")
-        initResult = BASS_Init(-1, 44100, BASS_DEVICE_DMIX, 0, 0)
+    ' Pass 1: Target Device with Console HWND
+    IF targetDevice <> -1 THEN
+        Trace("  Attempt 1: BASS_Init(device=" + LTRIM$(STR$(targetDevice)) + ", freq=44100, flags=8, win=" + LTRIM$(STR$(hConWnd)) + ")")
+        initResult = BASS_Init(targetDevice, 44100, BASS_DEVICE_DMIX | BASS_DEVICE_LATENCY, hConWnd, 0)
+        Trace("  Attempt 1 Result: " + LTRIM$(STR$(initResult)) + " | BASS_ErrorGetCode(): " + LTRIM$(STR$(BASS_ErrorGetCode())))
     ENDIF
 
-    IF initResult = 0 THEN initResult = BASS_Init(-1, 44100, 0, 0, 0)
+    ' Pass 2: Target Device with Desktop HWND + No DMIX
+    IF initResult = 0 AND targetDevice <> -1 THEN
+        BASS_Free()
+        Trace("  Attempt 2: BASS_Init(device=" + LTRIM$(STR$(targetDevice)) + ", freq=44100, flags=0, win=" + LTRIM$(STR$(hDeskWnd)) + ")")
+        initResult = BASS_Init(targetDevice, 44100, 0, hDeskWnd, 0)
+        Trace("  Attempt 2 Result: " + LTRIM$(STR$(initResult)) + " | BASS_ErrorGetCode(): " + LTRIM$(STR$(BASS_ErrorGetCode())))
+    ENDIF
+
+    ' Pass 3: Default Device (-1) with Console HWND + DMIX
+    IF initResult = 0 THEN
+        BASS_Free()
+        Trace("  Attempt 3: BASS_Init(device=-1, freq=44100, flags=8, win=" + LTRIM$(STR$(hConWnd)) + ")")
+        initResult = BASS_Init(-1, 44100, BASS_DEVICE_DMIX, hConWnd, 0)
+        Trace("  Attempt 3 Result: " + LTRIM$(STR$(initResult)) + " | BASS_ErrorGetCode(): " + LTRIM$(STR$(BASS_ErrorGetCode())))
+        IF initResult <> 0 THEN g_SelectedDevice = 0
+    ENDIF
+
+    ' Pass 4: Default Device (-1) with NULL HWND + Flag 0
+    IF initResult = 0 THEN
+        BASS_Free()
+        Trace("  Attempt 4: BASS_Init(device=-1, freq=44100, flags=0, win=0)")
+        initResult = BASS_Init(-1, 44100, 0, 0, 0)
+        Trace("  Attempt 4 Result: " + LTRIM$(STR$(initResult)) + " | BASS_ErrorGetCode(): " + LTRIM$(STR$(BASS_ErrorGetCode())))
+        IF initResult <> 0 THEN g_SelectedDevice = 0
+    ENDIF
+
+    Trace("InitAudioEngine: Final Return = " + LTRIM$(STR$(initResult)))
     RETURN initResult
 ENDSUB
 
@@ -2902,30 +2929,55 @@ SUB SwitchAudioOutputDevice(INT newDeviceListIdx)
 
     INT newDevID = g_AudioDeviceIDs[newDeviceListIdx]
     g_SelectedDevice = newDeviceListIdx
+    UINT hConWnd = GetConsoleWindow()
 
-    ' Initialize target output hardware in BASS 2.2 if needed
-    IF newDevID <> -1 THEN
-        BASS_Init(newDevID, 44100, BASS_DEVICE_DMIX, 0, 0)
-        BASS_SetDevice(newDevID)
-    ELSE
-        BASS_Init(-1, 44100, BASS_DEVICE_DMIX, 0, 0)
-        BASS_SetDevice(-1)
-    ENDIF
+    Trace("SwitchAudioOutputDevice: Switching to ListIdx " + LTRIM$(STR$(newDeviceListIdx)) + " (BASS DevID " + LTRIM$(STR$(newDevID)) + ")")
 
-    ' Re-route active audio stream to new hardware output
+    ' 1. Capture current stream state and free stream handle
+    QWORD curPos = 0q
+    INT isPlay = 0
     IF hStream <> 0 THEN
-        QWORD curPos = BASS_ChannelGetPosition(hStream)
-        INT isPlay   = BASS_ChannelIsActive(hStream)
-
+        curPos = BASS_ChannelGetPosition(hStream)
+        IF BASS_ChannelIsActive(hStream) = BASS_ACTIVE_PLAYING THEN isPlay = 1
         BASS_ChannelStop(hStream)
         BASS_StreamFree(hStream)
+        hStream = 0
+    ENDIF
 
+    ' 2. Safely free existing BASS context
+    BASS_Free()
+
+    ' 3. Restore custom buffer settings (wiped by BASS_Free)
+    BASS_SetConfig(BASS_CONFIG_UPDATEPERIOD, 20)
+    BASS_SetConfig(BASS_CONFIG_BUFFER, 3000)
+    BASS_SetConfig(BASS_CONFIG_DEV_BUFFER, 200)
+
+    ' 4. Re-initialize target device with Console HWND & Latency flag
+    INT initOk = 0
+    IF newDevID <> -1 THEN
+        initOk = BASS_Init(newDevID, 44100, BASS_DEVICE_DMIX | BASS_DEVICE_LATENCY, hConWnd, 0)
+    ENDIF
+
+    ' Fallback to default system device if target fails
+    IF initOk = 0 THEN
+        Trace("  Switch failed (Err " + LTRIM$(STR$(BASS_ErrorGetCode())) + "). Falling back to Default Device.")
+        BASS_Free() ' CRITICAL: Wipe broken context before fallback
+        initOk = BASS_Init(-1, 44100, BASS_DEVICE_DMIX | BASS_DEVICE_LATENCY, hConWnd, 0)
+        IF initOk <> 0 THEN g_SelectedDevice = 0
+    ENDIF
+
+    ' 5. Re-create stream and resume playback
+    IF initOk <> 0 AND g_TrackCount > 0 AND argIdx < g_TrackCount THEN
         hStream = CreateTrackStream(g_Playlist[argIdx])
-        ApplyAllDSP(hStream)
-        BASS_ChannelSetPosition(hStream, curPos)
-
-        IF isPlay = BASS_ACTIVE_PLAYING THEN
-            BASS_ChannelPlay(hStream, 0)
+        IF hStream <> 0 THEN
+            ApplyAllDSP(hStream)
+            BASS_ChannelSetPosition(hStream, curPos)
+            BASS_ChannelPreBuf(hStream, 2000)
+            IF isPlay = 1 THEN
+                BASS_ChannelPlay(hStream, 0)
+            ELSE
+                BASS_ChannelPause(hStream)
+            ENDIF
         ENDIF
     ENDIF
 
@@ -4019,17 +4071,19 @@ IF g_TrackCount = 0 THEN
     CLOSECONSOLE : END
 ENDIF
 
+' NEW CORRECT ORDER :
+EnsureDefaultEQProfiles()
+EnumerateAudioDevices()  ' 1. Scan available BASS soundcards FIRST
+LoadConfig()             ' 2. Read saved device_idx from cplay.ini SECOND
+
+' 3. Now initialize the engine with the restored g_SelectedDevice
 IF InitAudioEngine() = 0 THEN
     PRINT "Error: Failed to initialize BASS audio driver."
     RestoreConsoleScreen()
     CLOSECONSOLE : END
 ENDIF
 
-EnsureDefaultEQProfiles()
-EnumerateAudioDevices()
-LoadConfig()
 SetTheme()
-DrawStaticHUDBuf()
 
 ' If launched with -r, force Resume Mode active
 IF isResumeMode = 1 THEN g_ResumePos = 1
@@ -4068,12 +4122,22 @@ WHILE argIdx < g_TrackCount
     ' 2. Check stream creation success/failure
     IF hStream = 0 THEN
         INT finalErr = BASS_ErrorGetCode()
-        Trace("  -> CRITICAL: BASS_StreamCreateFile FAILED -> Error Code: " + LTRIM$(STR$(finalErr)))
+        Trace("  -> CRITICAL: Stream creation failed -> Error Code: " + LTRIM$(STR$(finalErr)))
         SetConsolePos(13, 4)
         SetColor(C_RED)
-        PRINT "[ERROR] Failed to load track! (Error Code: " + LTRIM$(STR$(finalErr)) + ") Skipping..."
+        PRINT "[ERROR] Audio output failed! Check USB DAC (BASS Err: " + LTRIM$(STR$(finalErr)) + ")"
         SetColor(colStatic)
-        Sleep(1200)
+        
+        ' Halt infinite skipping if audio engine is lost
+        IF finalErr = 8 OR finalErr = 5 OR finalErr = 4 THEN
+            PRINT " Audio device lost. Press SPACE to retry or Q to exit."
+            skipTrack = 0
+            WHILE INKEY$ = "" AND (GetAsyncKeyState(0x51) & 0x8000) = 0
+                Sleep(50)
+            WEND
+        ELSE
+            Sleep(1200)
+        ENDIF
     ELSE
         ' 3. Pause playback immediately
         BASS_ChannelPause(hStream)
@@ -4846,6 +4910,16 @@ WHILE argIdx < g_TrackCount
             IF g_NormEnabled = 1 AND (marqueeTick % 5 = 0) THEN
                UpdateStreamVolume(hStream)
             ENDIF
+
+            ' Hardware Endpoint Guard: Pause safely on USB DAC disconnection or driver loss
+            IF BASS_ChannelIsActive(hStream) = BASS_ACTIVE_STOPPED AND skipTrack = 0 THEN
+                INT devErr = BASS_ErrorGetCode()
+                IF devErr = 5 THEN ' BASS_ERROR_DEVICE
+                    BASS_ChannelPause(hStream)
+                    Trace("Hardware device lost or re-enumerated. Stream paused safely.")
+                ENDIF
+            ENDIF
+
             ' Pass addresses via & to allow in-place handle swapping
             CheckStreamTransition(&hStream, &argIdx)
 
