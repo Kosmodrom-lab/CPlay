@@ -3,4 +3,4 @@
 # Exclude include files or vendor libs from language stats
 *.html linguist-vendored
 *.inc linguist-vendored
-lib/* linguist-vendored
+Sources/* linguist-vendored
