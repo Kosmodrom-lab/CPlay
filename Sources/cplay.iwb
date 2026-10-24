@@ -13,11 +13,13 @@ $USE "ctl.lib"
 $USE "gdiplus.lib"
 $USE "normaliz.lib"
 $USE "ntdll.lib"
+$USE "user32.lib"
 
 $INCLUDE "windowssdk.inc"
 $INCLUDE "fletchie_ctl.inc"
 $INCLUDE "bass22.inc"
 $INCLUDE "gdiplus.inc"
+
 
 DECLARE IMPORT, API_LineTo ALIAS "LineTo"(UINT hdc, INT x, INT y), INT
 DECLARE IMPORT, API_RtlCompareMemory ALIAS "RtlCompareMemory"(POINTER Source1, POINTER Source2, DWORD Length), DWORD
@@ -139,12 +141,17 @@ TYPE CHAR_INFO
     WORD Attributes
 ENDTYPE
 
-' --- DIRECT VIDEO MEMORY BLITTING BUFFER (80x27) ---
+' --- DIRECT VIDEO MEMORY BLITTING BUFFERS (80x27) ---
 CHAR_INFO g_FrameBuf[2160]
 ' Shadow buffer array for top HUD (80 cols * 13 rows = 1040 CHAR_INFO cells)
 CHAR_INFO g_PrevTopBuf[1040]
 ' Shadow buffer array for extended region (80 cols * 11 rows = 880 CHAR_INFO cells)
 CHAR_INFO g_PrevExtBuf[880]
+
+CHAR_INFO g_PlaylistBuf[2160]
+CHAR_INFO g_OptionsBuf[2160]
+CHAR_INFO g_MoreOptionsBuf[2160]
+
 
 ' Cover Art
 UINT g_hCoverBmp   = 0
@@ -158,6 +165,9 @@ INT64 g_qpfFreq        = 0q
 INT   g_ticksPerMs     = 0
 INT64 g_qpcTargetTicks = 0q
 INT64 g_qpcFrameStart  = 0q
+
+' Cover Art Ticker
+INT g_CoverFrameTick = 0
 
 ' Playlist Marquee Animation Tickers
 INT plMarqueeTick             = 0
@@ -207,7 +217,7 @@ INT g_MoreFocus   = 0   ' Focused row index (0 to 4)
 
 ' 10 Bands EQ Listbox Coordinates on hOptionsBuffer
 CONST EQ_FORM_X = 42
-CONST EQ_FORM_Y = 10
+CONST EQ_FORM_Y = 11
 
 ' --- 10-Band Graphic EQ Globals ---
 DOUBLE g_EqFreqs[10]
@@ -545,6 +555,9 @@ RIGHT$("     " + LTRIM$(STR$(g_TrackCount)), 5) + "]" + SPACE$(26) + "SHUFFLE: "
 
     RefreshExtendedDisplayBuf(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
 
+    ' Draw bottom telemetry on rows 25 & 26
+    DrawBottomTelemetryBuf()
+
     ' Flush RAM matrix to active buffer
     FlushFrameBuffer(g_hConsole)
 
@@ -579,24 +592,30 @@ SUB SwitchToMoreOptionsView()
 ENDSUB
 
 SUB DrawOptionsScreen()
-    CLS
-    
-    ' Top Banner
-    SetColor(C_WHITE + (C_DARK_BLUE * 16))
-    SetConsolePos(0, 0)
-    PRINT "--[ EQUALIZER & DSP ]" + STRING$(59, 196)
+    INT i, rowY, isSel, itemIdx, isApplied
+    STRING dspNames[7], statusStr, rowText, lineStr
+
+    ' Clear matrix array before populating frame
+    FOR i = 0 TO 2159
+        g_OptionsBuf[i].BufChar = 32
+        g_OptionsBuf[i].Attributes = C_BLACK + (C_BLACK * 16)
+    NEXT i
+
+    ' --- Top Banner (Row 0 & 1) ---
+    STRING topHeader = STRING$(2, 196) + "[ EQUALIZER & DSP ]"
+    topHeader = LEFT$(topHeader + STRING$(80, 196), 80)
+    BufWriteEx(&g_OptionsBuf[0], 0, 0, topHeader, colVu + (colStatic * 16))
+    BufWriteEx(&g_OptionsBuf[0], 0, 1, STRING$(80, 196), colStatic + (C_BLACK * 16))
 
     ' ========================================================================
-    ' 1. TOP-LEFT LISTBOX: AUDIO DSP MODULES (g_OptionsFocus = 0)
+    ' 1. TOP-LEFT LISTBOX: AUDIO DSP MODULES (Moved down to Row 2)
     ' ========================================================================
-    SetConsolePos(2, 1)
-    IF g_OptionsFocus = 0
-       SetColor(C_YELLOW) : PRINT "[ Audio DSP Modules ]"
+    IF g_OptionsFocus = 0 THEN
+        BufWriteEx(&g_OptionsBuf[0], 2, 2, "[ Audio DSP Modules ]", C_YELLOW + (C_BLACK * 16))
     ELSE
-       SetColor(C_WHITE)  : PRINT "  Audio DSP Modules  "
+        BufWriteEx(&g_OptionsBuf[0], 2, 2, "  Audio DSP Modules  ", C_WHITE + (C_BLACK * 16))
     ENDIF
 
-    STRING dspNames[7]
     INT dspStates[7]
     dspNames[0] = "Master 10-Band EQ"     : dspStates[0] = g_EqEnabled
     dspNames[1] = "Volume Normalization"   : dspStates[1] = g_NormEnabled
@@ -606,12 +625,9 @@ SUB DrawOptionsScreen()
     dspNames[5] = "Stereo 3D Widener"      : dspStates[5] = g_WidenerEnabled
     dspNames[6] = "Headphone Crossfeed"    : dspStates[6] = g_CrossfeedEnabled
 
-    INT i, rowY, isSel
-    STRING statusStr, rowText
-
+    INT dspAttr
     FOR i = 0 TO 6
-        rowY = 2 + i
-        SetConsolePos(2, rowY)
+        rowY = 3 + i  
         isSel = (i = g_DspSelectedIndex)
 
         IF dspStates[i] = 1 THEN statusStr = "[ON]" ELSE statusStr = "[OFF]"
@@ -619,38 +635,34 @@ SUB DrawOptionsScreen()
 
         IF isSel THEN
             IF g_OptionsFocus = 0 THEN
-                IF dspStates[i] = 1 THEN SetColor(C_BLACK + (C_GREEN * 16)) ELSE SetColor(C_BLACK + (C_CYAN * 16))
+                IF dspStates[i] = 1 THEN dspAttr = C_BLACK + (C_GREEN * 16) ELSE dspAttr = C_BLACK + (C_CYAN * 16)
             ELSE
-                SetColor(C_BLACK + (C_DARK_GRAY * 16))
+                dspAttr = C_BLACK + (C_DARK_GRAY * 16)
             ENDIF
         ELSE
-            IF dspStates[i] = 1 THEN SetColor(C_GREEN) ELSE SetColor(C_LIGHT_GRAY)
+            IF dspStates[i] = 1 THEN dspAttr = C_GREEN + (C_BLACK * 16) ELSE dspAttr = C_LIGHT_GRAY + (C_BLACK * 16)
         ENDIF
 
-        PRINT LEFT$(rowText + SPACE$(35), 35)
+        BufWriteEx(&g_OptionsBuf[0], 2, rowY, LEFT$(rowText + SPACE$(35), 35), dspAttr)
     NEXT i
 
     ' ========================================================================
-    ' 2. BOTTOM-LEFT LISTBOX: PRESET SELECTION (g_OptionsFocus = 1)
+    ' 2. BOTTOM-LEFT LISTBOX: PRESET SELECTION (Moved down to Row 11)
     ' ========================================================================
-    SetConsolePos(2, 10)
-    IF g_OptionsFocus = 1
-      SetColor(C_YELLOW) : PRINT "[ Presets in .\\EQ\\ ]"
+    IF g_OptionsFocus = 1 THEN
+        BufWriteEx(&g_OptionsBuf[0], 2, 11, "[ Presets in .\\EQ\\ ]", C_YELLOW + (C_BLACK * 16))
     ELSE
-      SetColor(C_WHITE)  : PRINT "  Presets in .\\EQ\\  "
+        BufWriteEx(&g_OptionsBuf[0], 2, 11, "  Presets in .\\EQ\\  ", C_WHITE + (C_BLACK * 16))
     ENDIF
 
     INT visibleCount = 9
     INT startIdx = 0
     IF g_EqSelectedIndex >= visibleCount THEN startIdx = g_EqSelectedIndex - visibleCount + 1
 
-    INT itemIdx, isApplied
-    STRING lineStr
-
+    INT presetAttr
     FOR i = 0 TO visibleCount - 1
         itemIdx = startIdx + i
-        rowY = 11 + i
-        SetConsolePos(2, rowY)
+        rowY = 12 + i
         
         IF itemIdx < g_EqFileCount THEN
             isApplied = 0
@@ -658,48 +670,77 @@ SUB DrawOptionsScreen()
 
             IF itemIdx = g_EqSelectedIndex THEN
                 IF g_OptionsFocus = 1 THEN
-                    IF isApplied = 1 THEN SetColor(C_BLACK + (C_GREEN * 16)) ELSE SetColor(C_BLACK + (C_CYAN * 16))
+                    IF isApplied = 1 THEN presetAttr = C_BLACK + (C_GREEN * 16) ELSE presetAttr = C_BLACK + (C_CYAN * 16)
                 ELSE
-                    SetColor(C_BLACK + (C_DARK_GRAY * 16))
+                    presetAttr = C_BLACK + (C_DARK_GRAY * 16)
                 ENDIF
             ELSE
-                IF isApplied = 1 THEN SetColor(C_GREEN) ELSE SetColor(C_LIGHT_GRAY)
+                IF isApplied = 1 THEN presetAttr = C_GREEN + (C_BLACK * 16) ELSE presetAttr = C_LIGHT_GRAY + (C_BLACK * 16)
             ENDIF
 
             lineStr = " " + g_EqFileList[itemIdx]
             IF isApplied = 1 THEN lineStr = " [" + g_EqFileList[itemIdx] + "]"
-            PRINT LEFT$(lineStr + SPACE$(35), 35)
+            BufWriteEx(&g_OptionsBuf[0], 2, rowY, LEFT$(lineStr + SPACE$(35), 35), presetAttr)
         ELSE
-            SetColor(C_BLACK)
-            PRINT SPACE$(35)
+            BufWriteEx(&g_OptionsBuf[0], 2, rowY, SPACE$(35), C_BLACK + (C_BLACK * 16))
         ENDIF
     NEXT i
 
     ' ========================================================================
-    ' 3. BOTTOM-LEFT: SAVE PRESET PROMPT
+    ' 3. BOTTOM-LEFT: SAVE PRESET PROMPT (Moved down to Rows 22 & 23)
     ' ========================================================================
     IF g_SavePromptActive = 1 THEN
-        SetConsolePos(2, 21) : SetColor(C_YELLOW) : PRINT "Save preset name ?"
-        SetConsolePos(2, 22) : SetColor(C_BLACK + (C_WHITE * 16))
-        PRINT "> " + LEFT$(g_SaveNameBuf + "_" + SPACE$(33), 33)
-        SetColor(C_LIGHT_GRAY)
+        BufWriteEx(&g_OptionsBuf[0], 2, 22, "Save preset name ?", C_YELLOW + (C_BLACK * 16))
+        BufWriteEx(&g_OptionsBuf[0], 2, 23, "> " + LEFT$(g_SaveNameBuf + "_" + SPACE$(33), 33), C_BLACK + (C_WHITE * 16))
     ENDIF
 
     ' ========================================================================
-    ' 4. RIGHT PANEL: 10-BAND EQ PARAMETER FORM (g_OptionsFocus = 2)
+    ' 4. RIGHT PANEL: 10-BAND EQ PARAMETER FORM
     ' ========================================================================
     DrawEqNumericForm()
-    DrawEqResponseGraph()
 
-    ' Footer Hotkeys
-    SetColor(C_WHITE + (C_DARK_BLUE * 16))
-    SetConsolePos(0, 24)
-    IF g_SavePromptActive = 1 THEN
-        PRINT " [Enter] Save Preset | [Esc] Cancel Prompt | [Backspace] Delete" + SPACE$(17)
-    ELSE
-        PRINT " [Tab] Cycle Panel | [Space] Toggle/dB | [S]ave | [M]ore | [Esc] Back" + SPACE$(11)
-    ENDIF
-    SetColor(C_LIGHT_GRAY)
+    ' ========================================================================
+    ' 5. FOOTER DYNAMIC HOTKEYS & TELEMETRY
+    ' ========================================================================
+    STRING footerStr
+    SELECT g_SavePromptActive
+        CASE 1
+            footerStr = " [Enter] Save Preset " + CHR$(179) + " [Esc] Cancel Prompt " + CHR$(179) + " [Backspace] Delete" + SPACE$(17)
+        CASE 0
+            SELECT g_OptionsFocus
+                CASE 0
+                    footerStr = "[Tab] Next Panel " + CHR$(179) + " [Up/Dn] Move " + CHR$(179) + " [Space] Toggle DSP " + CHR$(179) + _
+" [M]ore " + CHR$(179) + " [Esc] Back" + SPACE$(6)
+                CASE 1
+                    footerStr = "[Tab] Panel " + CHR$(179) + " [Up/Dn] Select " + CHR$(179) + " [Enter] Apply " + CHR$(179) + _
+" [S]ave " + CHR$(179) + " [M]ore " + CHR$(179) + " [Esc] Back" + SPACE$(5)
+                CASE 2
+                    footerStr = "[Tab] Panel " + CHR$(179) + " [Up/Dn] Band " + CHR$(179) + " [Lft/Rgt] Adjust " + CHR$(179) + _
+" [S]ave " + CHR$(179) + " [M]ore " + CHR$(179) + " [Esc] Back" + SPACE$(4)
+            ENDSELECT
+    ENDSELECT
+
+    BufWriteEx(&g_OptionsBuf[0], 0, 24, footerStr, colVu + (colStatic * 16))
+
+    ' Telemetry Bar
+    STRING dspSummary = " DSP " + CHR$(175)
+    IF g_EqEnabled = 1 THEN dspSummary = dspSummary + " EQ : " + LEFT$(g_EqProfile, 6) + " " ELSE dspSummary = dspSummary + _
+" EQ : OFF "
+    IF g_NormEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " NORM "
+    IF g_CompEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " COMP "
+    IF g_ReverbEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " REV "
+    IF g_TubeEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " TUBE "
+    IF g_WidenerEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " WIDE "
+    IF g_CrossfeedEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " XFEED "
+
+    BufWriteEx(&g_OptionsBuf[0], 0, 25, STRING$(80, 196), colStatic + (C_BLACK * 16))
+    BufWriteEx(&g_OptionsBuf[0], 0, 26, LEFT$(dspSummary + SPACE$(80), 80), colStatic + (C_BLACK * 16))
+
+    ' --- Single Atomic Flush of Options Screen ---
+    FlushBufferEx(hOptionsBuffer, &g_OptionsBuf[0], 0, 26)
+
+    ' GDI Response Graph Pass
+    DrawEqResponseGraph()
 ENDSUB
 
 ' ----------------------------------------------------------------------------
@@ -723,13 +764,12 @@ SUB Parse10BandEQConfig(STRING eqName), INT
     STRING cleanName = LTRIM$(RTRIM$(eqName))
     IF cleanName = "" THEN RETURN 0
 
-    ' Guarantee .eq extension
     IF LCASE$(RIGHT$(cleanName, 3)) <> ".eq" THEN cleanName = cleanName + ".eq"
 
     STRING eqPath = GETSTARTPATH() + "EQ\\" + cleanName
     STRING lineStr, keyStr, valStr, tokenStr
     INT colonPos = 0, commaPos = 0, i = 0
-    
+
     g_EqPrecut = 0.0
     FOR i = 0 TO 9 : g_EqGains[i] = 0.0 : NEXT i
 
@@ -738,13 +778,13 @@ SUB Parse10BandEQConfig(STRING eqName), INT
     WHILE READ(hF, lineStr) = 0
         lineStr = LCASE$(LTRIM$(RTRIM$(lineStr)))
         colonPos = INSTR(lineStr, ":")
-        
+
         IF colonPos > 0 THEN
             keyStr = LTRIM$(RTRIM$(LEFT$(lineStr, colonPos - 1)))
             valStr = LTRIM$(RTRIM$(RIGHT$(lineStr, LEN(lineStr) - colonPos)))
 
             IF keyStr = "precut" THEN
-                g_EqPrecut = VAL(valStr)
+                g_EqPrecut = VAL(valStr) * 1.0
             ELSEIF keyStr = "bands" THEN
                 FOR i = 0 TO 9
                     commaPos = INSTR(valStr, ",")
@@ -755,7 +795,7 @@ SUB Parse10BandEQConfig(STRING eqName), INT
                         tokenStr = valStr
                         valStr   = ""
                     ENDIF
-                    g_EqGains[i] = VAL(tokenStr)
+                    g_EqGains[i] = VAL(tokenStr) * 1.0
                 NEXT i
             ENDIF
         ENDIF
@@ -832,24 +872,74 @@ SUB Save10BandEQConfig(STRING eqName), INT
     STRING cleanName = LTRIM$(RTRIM$(eqName))
     IF cleanName = "" THEN RETURN 0
 
-    ' Ensure .eq extension
+    ' Guarantee .eq extension
     IF LCASE$(RIGHT$(cleanName, 3)) <> ".eq" THEN cleanName = cleanName + ".eq"
 
     STRING eqPath = GETSTARTPATH() + "EQ\\" + cleanName
-    INT i
+    INT i, iG, absG, whole, frac
+    DOUBLE gVal
+    STRING signStr, valFormattedStr, bandsStr
 
     IF OPENFILE(hF, eqPath, "W") = 0 THEN
-        WRITE hF, "precut: " + LTRIM$(STR$(g_EqPrecut))
-        
-        STRING bandsStr = "bands: "
+        ' --- 1. Format Safety Precut ---
+        iG = INT(g_EqPrecut * 10.0)
+
+        SELECT 1
+            CASE (iG > 0)
+                signStr = "+"
+                absG = iG
+            CASE (iG < 0)
+                signStr = "-"
+                absG = -iG
+            DEFAULT
+                signStr = ""
+                absG = 0
+        ENDSELECT
+
+        whole = absG / 10
+        frac  = absG % 10
+        valFormattedStr = signStr + LTRIM$(STR$(whole)) + "." + LTRIM$(STR$(frac))
+
+        WRITE hF, "precut: " + valFormattedStr
+
+        ' --- 2. Format 10 EQ Bands ---
+        bandsStr = "bands: "
         FOR i = 0 TO 9
-            bandsStr = bandsStr + LTRIM$(STR$(g_EqGains[i]))
+            gVal = g_EqGains[i]
+            
+            ' Round to nearest tenth of a dB using pure integer arithmetic
+            SELECT 1
+                CASE (gVal >= 0.05)
+                    iG = INT(gVal * 10.0 + 0.5)
+                CASE (gVal <= -0.05)
+                    iG = INT(gVal * 10.0 - 0.5)
+                DEFAULT
+                    iG = 0
+            ENDSELECT
+
+            SELECT 1
+                CASE (iG > 0)
+                    signStr = ""
+                    absG = iG
+                CASE (iG < 0)
+                    signStr = "-"
+                    absG = -iG
+                DEFAULT
+                    signStr = ""
+                    absG = 0
+            ENDSELECT
+
+            whole = absG / 10
+            frac  = absG % 10
+            valFormattedStr = signStr + LTRIM$(STR$(whole)) + "." + LTRIM$(STR$(frac))
+
+            bandsStr = bandsStr + valFormattedStr
             IF i < 9 THEN bandsStr = bandsStr + ", "
         NEXT i
+
         WRITE hF, bandsStr
-        
         CLOSEFILE(hF)
-        
+
         ' Update active profile & rescan directory
         g_EqProfile = cleanName
         ScanEQProfiles()
@@ -1701,19 +1791,55 @@ SUB BufClear(WORD defaultAttr)
     NEXT i
 ENDSUB
 
-' Write a string into the in-memory matrix at (x, y) with a color attribute
-SUB BufWrite(INT x, INT y, STRING txt$, WORD attr)
-    INT i, txtLen = LEN(txt$)
-    INT idx = (y * 80) + x
-    POINTER pTxt = &txt$
+SUB BufWriteEx(POINTER pMatrix, INT x, INT y, STRING txt, INT attr)
+    IF pMatrix = 0 THEN RETURN
+    IF y < 0 OR y >= 27 THEN RETURN
+    
+    INT i, txtLen, cellIdx
+    POINTER pCharInfo = pMatrix
+    
+    txtLen = LEN(txt)
+    IF txtLen = 0 THEN RETURN
+
+    ' Clip horizontal boundaries to 80 cols
+    IF x + txtLen > 80 THEN txtLen = 80 - x
+    IF txtLen <= 0 THEN RETURN
 
     FOR i = 0 TO txtLen - 1
-        IF (x + i) < 80 AND y < 27 THEN
-            g_FrameBuf[idx].BufChar = #<BYTE>pTxt[i]
-            g_FrameBuf[idx].Attributes = attr
-            idx = idx + 1
-        ENDIF
+        cellIdx = (y * 80) + (x + i)
+        
+        ' Write ASCII byte and Attribute directly using existing BufChar field
+        #<CHAR_INFO>(pCharInfo + (cellIdx * 4)).BufChar    = ASC(MID$(txt, i + 1, 1))
+        #<CHAR_INFO>(pCharInfo + (cellIdx * 4)).Attributes = attr
     NEXT i
+ENDSUB
+
+' Write a string into the in-memory matrix at (x, y) with a color attribute
+SUB BufWrite(INT x, INT y, STRING txt, INT attr)
+    BufWriteEx(&g_FrameBuf[0], x, y, txt, attr)
+ENDSUB
+
+SUB FlushBufferEx(INT hTargetConsole, POINTER pMatrix, INT topRow, INT bottomRow)
+    IF hTargetConsole = 0 OR hTargetConsole = -1 OR pMatrix = 0 THEN RETURN
+
+    COORD bSize, bCoord
+    SMALL_RECT wRegion
+
+    bSize.X = 80
+    bSize.Y = 27
+
+    bCoord.X = 0
+    bCoord.Y = topRow
+
+    wRegion.Left   = 0
+    wRegion.Top    = topRow
+    wRegion.Right  = 79
+    wRegion.Bottom = bottomRow
+
+    ' Calculate byte offset to starting row (80 cells * 4 bytes per CHAR_INFO)
+    POINTER pStartCell = pMatrix + (topRow * 80 * 4)
+
+    WriteConsoleOutputA(hTargetConsole, pStartCell, bSize, bCoord, &wRegion)
 ENDSUB
 
 ' Flushes the entire 80x27 memory matrix to video RAM in 1 atomic OS call
@@ -1810,6 +1936,7 @@ SUB FlushExtendedRegion(HANDLE hConsole)
     RtlMoveMemory(&g_PrevExtBuf, &g_FrameBuf[1040], extByteLen)
 ENDSUB
 
+
 SUB SetConsolePos(INT x, INT y)
     COORD pos
     pos.X = x : pos.Y = y
@@ -1852,6 +1979,17 @@ SUB GetFileNameOnly(STRING fullPath), STRING
         ENDIF
     NEXT i
     RETURN fullPath
+ENDSUB
+
+SUB ExtractParenthesisName(STRING fullDevName), STRING
+    INT pStart = INSTR(fullDevName, "(")
+    INT pEnd   = INSTR(fullDevName, ")")
+
+    IF pStart > 0 AND pEnd > pStart THEN
+        RETURN MID$(fullDevName, pStart + 1, pEnd - pStart - 1)
+    ENDIF
+
+    RETURN fullDevName
 ENDSUB
 
 ' ----------------------------------------------------------------------------
@@ -2205,35 +2343,40 @@ ENDSUB
 SUB DrawPlaylistScreen()
     INT visibleCount = 19
     INT i, realIdx, rowY, isPlSelected
-    STRING trackName, trackLine, numPrefix, playingTag, dispName, headerStr
+    STRING trackName, trackLine, numPrefix, playingTag, dispName, headerStr, timeInfo
 
     ' 1. Calculate Pagination Math
     INT totalPages = (g_FilteredCount + visibleCount - 1) / visibleCount
     IF totalPages < 1 THEN totalPages = 1
     INT currentPage = (g_PlaylistSelectIdx / visibleCount) + 1
 
-    ' 2. Top Header Banner - Row 0
-    SetColor(colTech + (colStatic * 16))
-    SetConsolePos(0, 0)
-    IF g_SearchActive = 0
-       timeInfo = " | Total: " + FormatTotalDuration()
+    ' Clear matrix array before populating frame
+    FOR i = 0 TO 2159
+        g_PlaylistBuf[i].BufChar = 32
+        g_PlaylistBuf[i].Attributes = C_BLACK + (C_BLACK * 16)
+    NEXT i
+
+    ' --- 2. Top Header Banner (Row 0 & 1) ---
+    IF g_SearchActive = 0 AND g_SearchBuf = "" THEN
+        timeInfo = " " + CHR$(179) + " Total: " + FormatTotalDuration()
     ELSE
-       timeInfo = ""
+        timeInfo = ""
     ENDIF
 
-    headerStr = "--[ BROWSE PLAYLIST (" + LTRIM$(STR$(g_FilteredCount)) + " Tracks | Pg " + LTRIM$(STR$(currentPage)) + "/" + _
-LTRIM$(STR$(totalPages)) + timeInfo + ") ]"
-    PRINT LEFT$(headerStr + STRING$(80, 196), 80)
+    headerStr = STRING$(2, 196) + "[ BROWSE PLAYLIST (" + LTRIM$(STR$(g_FilteredCount)) + " Tracks " + CHR$(179) + " Pg " + _
+LTRIM$(STR$(currentPage)) + "/" + LTRIM$(STR$(totalPages)) + timeInfo + ") ]"
 
-    ' Row 1: Blank Separator
-    SetConsolePos(0, 1)
-    SetColor(C_BLACK)
-    PRINT SPACE$(80)
+    headerStr = LEFT$(headerStr + STRING$(80, 196), 80)
 
-    ' 3. Visible Viewport Item Rendering (Rows 2 to 20 = 19 Tracks)
+    ' Write Header to Matrix
+    BufWriteEx(&g_PlaylistBuf[0], 0, 0, headerStr, colVu + (colStatic * 16))
+    ' Separator
+    BufWriteEx(&g_PlaylistBuf[0], 0, 1, STRING$(80, 196), colStatic + (C_BLACK * 16))
+
+    ' --- 3. Visible Viewport Item Rendering (Rows 2 to 20 = 19 Tracks) ---
+    INT trackAttr
     FOR i = 0 TO visibleCount - 1
         rowY = 2 + i
-        SetConsolePos(0, rowY)
 
         IF (g_PlaylistScrollOffset + i) < g_FilteredCount THEN
             realIdx = g_FilteredIndices[g_PlaylistScrollOffset + i]
@@ -2257,79 +2400,87 @@ LTRIM$(STR$(totalPages)) + timeInfo + ") ]"
             ' Dynamic Theme Coloring Logic
             IF isPlSelected = 1 THEN
                 IF realIdx = argIdx THEN
-                    SetColor(C_BLACK + (colStatusPlay * 16))
+                    trackAttr = C_BLACK + (colStatusPlay * 16)
                 ELSE
-                    SetColor(C_BLACK + (colArtist * 16))
+                    trackAttr = C_BLACK + (colArtist * 16)
                 ENDIF
                 trackLine = ">" + RIGHT$(trackLine, 76)
             ELSE
                 IF realIdx = argIdx THEN
-                    SetColor(colStatusPlay)
+                    trackAttr = colStatusPlay + (C_BLACK * 16)
                 ELSE
-                    SetColor(colVu)
+                    trackAttr = colVu + (C_BLACK * 16)
                 ENDIF
             ENDIF
 
-            PRINT trackLine
+            BufWriteEx(&g_PlaylistBuf[0], 0, rowY, trackLine, trackAttr)
         ELSE
-            SetColor(C_BLACK)
-            PRINT SPACE$(77)
+            BufWriteEx(&g_PlaylistBuf[0], 0, rowY, SPACE$(77), C_BLACK + (C_BLACK * 16))
         ENDIF
 
-        ' 4. Render Scroll Bar Track on the Right Margin (Column 78)
-        SetConsolePos(78, rowY)
+        ' --- 4. Render Scroll Bar Track on Right Margin (Column 78) ---
         IF g_FilteredCount > visibleCount THEN
-            INT thumbPos = (g_PlaylistScrollOffset * (visibleCount - 1)) / (g_FilteredCount - visibleCount)
+            INT maxScroll = g_FilteredCount - visibleCount
+            IF maxScroll < 1 THEN maxScroll = 1
+            INT thumbPos = (g_PlaylistScrollOffset * (visibleCount - 1)) / maxScroll
+
             IF i = thumbPos THEN
-                SetColor(C_WHITE)
-                PRINT CHR$(219)  ' Active Scrollbar Thumb
+                BufWriteEx(&g_PlaylistBuf[0], 78, rowY, CHR$(219), C_WHITE + (C_BLACK * 16))
             ELSE
-                SetColor(colStatic)
-                PRINT CHR$(176) ' Background Scrollbar Track
+                BufWriteEx(&g_PlaylistBuf[0], 78, rowY, CHR$(176), colStatic + (C_BLACK * 16))
             ENDIF
         ELSE
-            SetColor(C_BLACK)
-            PRINT " "
+            BufWriteEx(&g_PlaylistBuf[0], 78, rowY, " ", C_BLACK + (C_BLACK * 16))
         ENDIF
     NEXT i
 
-    ' Row 21: Blank Separator
-    SetConsolePos(0, 21)
-    SetColor(C_BLACK)
-    PRINT SPACE$(80)
+    ' Row 21: Separator
+    BufWriteEx(&g_PlaylistBuf[0], 0, 21, STRING$(80, 250), colStatic + (C_BLACK * 16))
 
-    ' 5. Search Filter Bar (Row 22)
-    SetConsolePos(0, 22)
+    ' --- 5. Search Filter Bar (Row 22) ---
+    STRING searchStr
+    INT searchAttr
     IF g_SearchActive = 1 THEN
-        SetColor(colAlbum + (colStatic * 16))
-        PRINT LEFT$(" Search: " + g_SearchBuf + "_" + SPACE$(80), 80)
+        searchAttr = C_BLACK + (C_WHITE * 16)
+        searchStr  = LEFT$(" Search: " + g_SearchBuf + "_" + SPACE$(80), 80)
     ELSE
-        SetColor(colStatic)
+        searchAttr = colStatic + (C_BLACK * 16)
         IF g_SearchBuf <> "" THEN
-            PRINT LEFT$(" Filter Active: \"" + g_SearchBuf + "\" (Press [S] to Edit, [Esc] to Clear)" + SPACE$(80), 80)
+            searchStr = LEFT$(" Filter Active: \"" + g_SearchBuf + "\" (Press [S] to Edit, [Esc] to Clear)" + SPACE$(80), 80)
         ELSE
-            PRINT LEFT$(" Press [S] to Search / Filter Playlist..." + SPACE$(80), 80)
+            searchStr = LEFT$(" Press [S] to Search / Filter Playlist..." + SPACE$(80), 80)
         ENDIF
     ENDIF
+    BufWriteEx(&g_PlaylistBuf[0], 0, 22, searchStr, searchAttr)
 
     ' Row 23: Blank Separator
-    SetConsolePos(0, 23)
-    SetColor(C_BLACK)
-    PRINT SPACE$(80)
+    BufWriteEx(&g_PlaylistBuf[0], 0, 23, SPACE$(80), C_BLACK + (C_BLACK * 16))
 
-    ' 6. Footer Hotkey Bar (Row 24)
-    SetColor(colVu + (colStatic * 16))
-    SetConsolePos(0, 24)
+    ' --- 6. Footer Hotkey Bar (Row 24) ---
+    STRING footerStr
     IF g_SearchActive = 1 THEN
-        PRINT LEFT$(" [Enter] Play Selected | [Backspace] Delete | [Esc] Cancel Search" + SPACE$(80), 80)
+        footerStr = LEFT$(" [Enter] Play Selected " + CHR$(179) + " [Backspace] Delete " + CHR$(179) + " [Esc] Cancel Search" + _
+SPACE$(80), 80)
     ELSE
-        PRINT LEFT$(" [S]earch | [Enter] Play & Resume Queue | [P]lay All Filtered | [Esc] Back" + SPACE$(80), 80)
+        footerStr = LEFT$(" [S]earch " + CHR$(179) + " [Enter] Play & Resume Queue " + CHR$(179) + " [P]lay All Filtered " + _
+CHR$(179) + " [Esc] Back" + SPACE$(80), 80)
     ENDIF
-    SetColor(C_LIGHT_GRAY)
+    BufWriteEx(&g_PlaylistBuf[0], 0, 24, footerStr, colVu + (colStatic * 16))
+
+    ' --- 7. Bottom Telemetry Bar (Rows 25 & 26) ---
+    STRING sysSummary = " TRACKS: " + LTRIM$(STR$(g_FilteredCount)) + " / " + LTRIM$(STR$(g_TrackCount))
+    sysSummary = LEFT$(sysSummary + SPACE$(80), 80)
+
+    BufWriteEx(&g_PlaylistBuf[0], 0, 25, STRING$(80, 196), colStatic + (C_BLACK * 16))
+    BufWriteEx(&g_PlaylistBuf[0], 0, 26, sysSummary, colStatic + (C_BLACK * 16))
+
+    ' --- 8. Single Atomic Flush of Entire Framebuffer ---
+    FlushBufferEx(hPlaylistBuffer, &g_PlaylistBuf[0], 0, 26)
 ENDSUB
 
 SUB DrawStaticHUDBuf()
-    BufWrite(0, 0, " [SPACE] Pause | [P]rev | [N]ext | [S]huffle | [Up/Dn] Vol | [Lft/Rgt] Seek" + SPACE$(5), colVu + (colStatic * 16))
+    BufWrite(0, 0, " [SPACE] Pause " + CHR$(179) + " [P]rev " + CHR$(179) + " [N]ext " + CHR$(179) + " [S]huffle " + CHR$(179) + " [Up/Dn] Vol " + CHR$(179) + " [Lft/Rgt] Seek" + SPACE$(5), colVu + (colStatic * 16))
+    BufWrite(0, 1, STRING$(80, 196), ColStatic)
     BufWrite(1, 2, " ARTIST   :", colStatic)
     BufWrite(1, 3, " TITLE    :", colStatic)
     BufWrite(1, 4, " ALBUM    :", colStatic)
@@ -2341,7 +2492,38 @@ SUB DrawStaticHUDBuf()
     BufWrite(1, 9, " FORMAT   :", colStatic)
     BufWrite(1, 10, " BITRATE  :", colStatic)
     BufWrite(1, 11, " SIZE     :", colStatic)
-    BufWrite(0, 24, " [B]rowse playlist | [ [T]hemes | [C]omments | [L]yrics | [O]ptions | [Q]uit" + SPACE$(4), colVu + (colStatic * 16))
+    BufWrite(0, 12, STRING$(80, 250), ColStatic)
+    BufWrite(0, 24, " [B]rowse playlist " + CHR$(179) + " [ [T]hemes " + CHR$(179) + " [C]omments " + CHR$(179) + " [L]yrics " + CHR$(179) + " [O]ptions " + CHR$(179) + " [Q]uit" + SPACE$(4), colVu + (colStatic * 16))
+    DrawBottomTelemetryBuf()
+ENDSUB
+
+SUB DrawBottomTelemetryBuf()
+    ' Build Active DSP summary (All 7 Modules)
+    STRING dspSummary = " DSP " + CHR$(175)
+    IF g_EqEnabled = 1 THEN dspSummary = dspSummary + " EQ : " + LEFT$(g_EqProfile, 6) + " " ELSE dspSummary = dspSummary + " EQ : OFF "
+    IF g_NormEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " NORM "
+    IF g_CompEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " COMP "
+    IF g_ReverbEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " REV "
+    IF g_TubeEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " TUBE "
+    IF g_WidenerEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " WIDE "
+    IF g_CrossfeedEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " XFEED "
+
+    ' --- Extract Audio Device Name inside Parenthesis ---
+    STRING rawDevName = "Default Device"
+    IF g_SelectedDevice >= 0 AND g_SelectedDevice < g_AudioDeviceCount THEN
+        rawDevName = g_AudioDeviceList[g_SelectedDevice]
+    ENDIF
+
+    STRING cleanDevName = ExtractParenthesisName(rawDevName)
+
+    ' Build Right-Hand Telemetry Stats
+    STRING rightTelemetry = "DEV: " + LEFT$(cleanDevName, 22)
+    ' Combine Left DSP Summary and Right-Aligned Hardware Stats
+    STRING fullRow26 = LEFT$(dspSummary + SPACE$(40), 40) + RIGHT$(SPACE$(40) + cleanDevName, 40)
+
+    BufWriteEx(&g_FrameBuf[0], 0, 25, STRING$(80, 196), colStatic + (C_BLACK * 16))
+    BufWriteEx(&g_FrameBuf[0], 0, 26, fullRow26, colStatic + (C_BLACK * 16))
+
 ENDSUB
 
 SUB DrawStatusLineBuf(INT isPlaying, DOUBLE currentSecs, DOUBLE totalSecs, INT volLevel)
@@ -2411,214 +2593,229 @@ SUB RedrawCurrentScreen()
 ENDSUB
 
 SUB DrawMoreOptionsScreen()
-    CLS
+    INT i
+    ' Clear matrix array
+    FOR i = 0 TO 2159
+        g_MoreOptionsBuf[i].BufChar = 32
+        g_MoreOptionsBuf[i].Attributes = C_BLACK + (C_BLACK * 16)
+    NEXT i
 
     ' Top Banner
-    SetColor(C_WHITE + (C_DARK_BLUE * 16))
-    SetConsolePos(0, 0)
-    PRINT "--[ AUDIO ENGINE & ACCESSIBILITY OPTIONS ]" + STRING$(38, 196)
+    STRING headerStr = STRING$(2, 196) + "[ AUDIO ENGINE & ACCESSIBILITY OPTIONS ]"
+    headerStr = LEFT$(headerStr + STRING$(80, 196), 80)
+    BufWriteEx(&g_MoreOptionsBuf[0], 0, 0, headerStr, colVu + (colStatic * 16))
+    BufWriteEx(&g_MoreOptionsBuf[0], 0, 1, STRING$(80, 196), colStatic + (C_BLACK * 16))
 
     ' ------------------------------------------------------------------------
     ' 1. ACCESSIBILITY & AUDIO BALANCE
     ' ------------------------------------------------------------------------
-    SetConsolePos(2, 3)
-    SetColor(C_YELLOW)
-    PRINT "[ Hearing & Audio Balance ]"
+    BufWriteEx(&g_MoreOptionsBuf[0], 2, 3, "[ Hearing & Audio Balance ]", C_YELLOW + (C_BLACK * 16))
 
     ' Row 0: L/R Balance Slider
-    SetConsolePos(2, 5)
-    IF g_MoreFocus = 0 THEN SetColor(C_BLACK + (C_CYAN * 16)) ELSE SetColor(C_LIGHT_GRAY)
-    PRINT "  L/R Channel Balance  : "
+    INT lblAttr, valAttr
+    IF g_MoreFocus = 0 THEN lblAttr = C_BLACK + (C_CYAN * 16) ELSE lblAttr = C_LIGHT_GRAY + (C_BLACK * 16)
+    BufWriteEx(&g_MoreOptionsBuf[0], 2, 5, "  L/R Channel Balance  : ", lblAttr)
 
     STRING balStr = "CENTER (0)"
     IF g_Balance < 0 THEN balStr = "L " + LTRIM$(STR$(ABS(g_Balance))) + "%"
     IF g_Balance > 0 THEN balStr = "R " + LTRIM$(STR$(g_Balance)) + "%"
 
-    SetConsolePos(27, 5)
-    IF g_MoreFocus = 0 THEN SetColor(C_BLACK + (C_WHITE * 16)) ELSE SetColor(C_WHITE)
-    PRINT "< " + LEFT$(balStr + SPACE$(12), 12) + " >"
+    IF g_MoreFocus = 0 THEN valAttr = C_BLACK + (C_WHITE * 16) ELSE valAttr = C_WHITE + (C_BLACK * 16)
+    BufWriteEx(&g_MoreOptionsBuf[0], 27, 5, "< " + LEFT$(balStr + SPACE$(12), 12) + " >", valAttr)
 
     ' Row 1: Mono Downmix Toggle
-    SetConsolePos(2, 7)
-    IF g_MoreFocus = 1 THEN SetColor(C_BLACK + (C_CYAN * 16)) ELSE SetColor(C_LIGHT_GRAY)
-    PRINT "  Mono Downmix         : "
+    IF g_MoreFocus = 1 THEN lblAttr = C_BLACK + (C_CYAN * 16) ELSE lblAttr = C_LIGHT_GRAY + (C_BLACK * 16)
+    BufWriteEx(&g_MoreOptionsBuf[0], 2, 7, "  Mono Downmix         : ", lblAttr)
 
-    SetConsolePos(27, 7)
     SELECT g_MonoDownmix
-        CASE 1 : SetColor(C_GREEN) : PRINT "[ON]  (Sum L+R to Both Ears)"
-        CASE 0 : SetColor(C_RED)   : PRINT "[OFF] (Standard Stereo)"
+        CASE 1 : BufWriteEx(&g_MoreOptionsBuf[0], 27, 7, "[ON]  (Sum L+R to Both Ears)", C_GREEN + (C_BLACK * 16))
+        CASE 0 : BufWriteEx(&g_MoreOptionsBuf[0], 27, 7, "[OFF] (Standard Stereo)", C_RED + (C_BLACK * 16))
     ENDSELECT
 
     ' ------------------------------------------------------------------------
     ' 2. PLAYBACK ENGINE SETTINGS
     ' ------------------------------------------------------------------------
-    SetConsolePos(2, 10)
-    SetColor(C_YELLOW)
-    PRINT "[ Playback & Stream Engine ]"
+    BufWriteEx(&g_MoreOptionsBuf[0], 2, 10, "[ Playback & Stream Engine ]", C_YELLOW + (C_BLACK * 16))
 
     ' Row 2: Active Audio Output Device
-    SetConsolePos(2, 12)
-    IF g_MoreFocus = 2 THEN SetColor(C_BLACK + (C_CYAN * 16)) ELSE SetColor(C_LIGHT_GRAY)
-    PRINT "  Audio Output Device  : "
+    IF g_MoreFocus = 2 THEN lblAttr = C_BLACK + (C_CYAN * 16) ELSE lblAttr = C_LIGHT_GRAY + (C_BLACK * 16)
+    BufWriteEx(&g_MoreOptionsBuf[0], 2, 12, "  Audio Output Device  : ", lblAttr)
 
     STRING devNameStr = "Default System Device"
     IF g_SelectedDevice >= 0 AND g_SelectedDevice < g_AudioDeviceCount THEN
         devNameStr = g_AudioDeviceList[g_SelectedDevice]
     ENDIF
 
-    SetConsolePos(27, 12)
-    IF g_MoreFocus = 2 THEN SetColor(C_BLACK + (C_WHITE * 16)) ELSE SetColor(C_CYAN)
-    PRINT "< " + LEFT$(devNameStr + SPACE$(48), 48) + " >"
+    IF g_MoreFocus = 2 THEN valAttr = C_BLACK + (C_WHITE * 16) ELSE valAttr = C_CYAN + (C_BLACK * 16)
+    BufWriteEx(&g_MoreOptionsBuf[0], 27, 12, "< " + LEFT$(devNameStr + SPACE$(48), 48) + " >", valAttr)
 
     ' Row 3: Gapless Pre-loading Toggle
-    SetConsolePos(2, 14)
-    IF g_MoreFocus = 3 THEN SetColor(C_BLACK + (C_CYAN * 16)) ELSE SetColor(C_LIGHT_GRAY)
-    PRINT "  Gapless Pre-loading  : "
+    IF g_MoreFocus = 3 THEN lblAttr = C_BLACK + (C_CYAN * 16) ELSE lblAttr = C_LIGHT_GRAY + (C_BLACK * 16)
+    BufWriteEx(&g_MoreOptionsBuf[0], 2, 14, "  Gapless Pre-loading  : ", lblAttr)
 
-    SetConsolePos(27, 14)
     SELECT g_Gapless
-        CASE 1 : SetColor(C_GREEN) : PRINT "[ON]  (Zero-delay Track Transitions)"
-        CASE 0 : SetColor(C_RED)   : PRINT "[OFF] (Standard Disk Load)"
+        CASE 1 : BufWriteEx(&g_MoreOptionsBuf[0], 27, 14, "[ON]  (Zero-delay Track Transitions)", C_GREEN + (C_BLACK * 16))
+        CASE 0 : BufWriteEx(&g_MoreOptionsBuf[0], 27, 14, "[OFF] (Standard Disk Load)", C_RED + (C_BLACK * 16))
     ENDSELECT
 
     ' Row 4: Crossfade Delay
-    SetConsolePos(2, 16)
-    IF g_MoreFocus = 4 THEN SetColor(C_BLACK + (C_CYAN * 16)) ELSE SetColor(C_LIGHT_GRAY)
-    PRINT "  Crossfade Delay      : "
+    IF g_MoreFocus = 4 THEN lblAttr = C_BLACK + (C_CYAN * 16) ELSE lblAttr = C_LIGHT_GRAY + (C_BLACK * 16)
+    BufWriteEx(&g_MoreOptionsBuf[0], 2, 16, "  Crossfade Delay      : ", lblAttr)
 
-    SetConsolePos(27, 16)
     IF g_Crossfade = 0 THEN
-        SetColor(C_LIGHT_GRAY) : PRINT "[OFF] (0.0 Seconds)"
+        BufWriteEx(&g_MoreOptionsBuf[0], 27, 16, "[OFF] (0.0 Seconds)", C_LIGHT_GRAY + (C_BLACK * 16))
     ELSE
-        SetColor(C_CYAN) : PRINT "[" + LTRIM$(STR$(g_Crossfade)) + ".0 Seconds]"
+        BufWriteEx(&g_MoreOptionsBuf[0], 27, 16, "[" + LTRIM$(STR$(g_Crossfade)) + ".0 Seconds]", C_CYAN + (C_BLACK * 16))
     ENDIF
 
     ' Row 5: Startup Position Resume
-    SetConsolePos(2, 18)
-    IF g_MoreFocus = 5 THEN SetColor(C_BLACK + (C_CYAN * 16)) ELSE SetColor(C_LIGHT_GRAY)
-    PRINT "  Resume Track Position: "
+    IF g_MoreFocus = 5 THEN lblAttr = C_BLACK + (C_CYAN * 16) ELSE lblAttr = C_LIGHT_GRAY + (C_BLACK * 16)
+    BufWriteEx(&g_MoreOptionsBuf[0], 2, 18, "  Resume Track Position: ", lblAttr)
 
-    SetConsolePos(27, 18)
     SELECT g_ResumePos
-        CASE 1 : SetColor(C_GREEN) : PRINT "[ON]  (Remember Track & Time on Startup)"
-        CASE 0 : SetColor(C_RED)   : PRINT "[OFF] (Always Start Fresh)"
+        CASE 1 : BufWriteEx(&g_MoreOptionsBuf[0], 27, 18, "[ON]  (Remember Track & Time on Startup)", C_GREEN + (C_BLACK * 16))
+        CASE 0 : BufWriteEx(&g_MoreOptionsBuf[0], 27, 18, "[OFF] (Always Start Fresh)", C_RED + (C_BLACK * 16))
     ENDSELECT
 
     ' Footer Hotkeys
-    SetColor(C_WHITE + (C_DARK_BLUE * 16))
-    SetConsolePos(0, 24)
-    PRINT " [Up/Dn] Select | [Lft/Rgt] Adjust | [Space] Cycle/Toggle | [Esc] Back to EQ" + SPACE$(4)
-    SetColor(C_LIGHT_GRAY)
+    BufWriteEx(&g_MoreOptionsBuf[0], 0, 24, " [Up/Dn] Select " + CHR$(179) + " [Lft/Rgt] Adjust " + CHR$(179) + _
+" [Space] Cycle/Toggle " + CHR$(179) + " [Esc] Back to EQ" + SPACE$(4), colVu + (colStatic * 16))
+
+    ' Telemetry Bar
+    STRING dspSummary = " BALANCE: " + LTRIM$(STR$(g_Balance)) + "% " + CHR$(250) + " MONO: " + LTRIM$(STR$(g_MonoDownmix)) + _
+" " + CHR$(250) + " GAPLESS: " + LTRIM$(STR$(g_Gapless)) + " " + CHR$(250) + " CROSSFADE: " + LTRIM$(STR$(g_Crossfade)) + "s"
+    BufWriteEx(&g_MoreOptionsBuf[0], 0, 25, STRING$(80, 196), colStatic + (C_BLACK * 16))
+    BufWriteEx(&g_MoreOptionsBuf[0], 0, 26, LEFT$(dspSummary + SPACE$(80), 80), colStatic + (C_BLACK * 16))
+
+    ' Single Atomic Flush
+    FlushBufferEx(hMoreOptionsBuffer, &g_MoreOptionsBuf[0], 0, 26)
 ENDSUB
 
 SUB DrawEqNumericForm()
-    INT band, rowY, iG, whole, frac
+    INT band, rowY, iG, absG, whole, frac
     DOUBLE gVal
     STRING freqLabels[10]
     STRING labelStr, valStr, signStr, tensStr, onesStr, fracStr
+    INT lblAttr, valAttr
 
-    freqLabels[0] = "  31 Hz"
-    freqLabels[1] = "  62 Hz"
-    freqLabels[2] = " 125 Hz"
-    freqLabels[3] = " 250 Hz"
-    freqLabels[4] = " 500 Hz"
-    freqLabels[5] = "  1 kHz"
-    freqLabels[6] = "  2 kHz"
-    freqLabels[7] = "  4 kHz"
-    freqLabels[8] = "  8 kHz"
+    freqLabels[0] = "  31 Hz" : freqLabels[1] = "  62 Hz" : freqLabels[2] = " 125 Hz"
+    freqLabels[3] = " 250 Hz" : freqLabels[4] = " 500 Hz" : freqLabels[5] = "  1 kHz"
+    freqLabels[6] = "  2 kHz" : freqLabels[7] = "  4 kHz" : freqLabels[8] = "  8 kHz"
     freqLabels[9] = " 16 kHz"
 
-    ' Form Header (Now rendered at Row 10)
-    SetConsolePos(EQ_FORM_X, EQ_FORM_Y)
-    IF g_OptionsFocus = 2 THEN
-        SetColor(C_YELLOW)
-        PRINT " [  10-Band EQ Parameters ]"
-    ELSE
-        SetColor(C_WHITE)
-        PRINT "    10-Band EQ Parameters "
-    ENDIF
+    ' Form Header
+    SELECT g_OptionsFocus
+        CASE 2
+            BufWriteEx(&g_OptionsBuf[0], EQ_FORM_X, EQ_FORM_Y, " [  10-Band EQ Parameters ]", C_YELLOW + (C_BLACK * 16))
+        DEFAULT
+            BufWriteEx(&g_OptionsBuf[0], EQ_FORM_X, EQ_FORM_Y, "    10-Band EQ Parameters ", C_WHITE + (C_BLACK * 16))
+    ENDSELECT
 
     FOR band = 0 TO 9
         rowY = EQ_FORM_Y + 1 + band
 
         ' 1. Print Band Label
-        SetConsolePos(EQ_FORM_X + 1, rowY)
-        IF (band = g_SelectedEqBand AND g_OptionsFocus = 2) THEN
-            SetColor(C_BLACK + (C_CYAN * 16))
-            labelStr = "  Band " + RIGHT$(" " + LTRIM$(STR$(band + 1)), 2) + " [" + freqLabels[band] + "] : "
-        ELSE
-            SetColor(C_LIGHT_GRAY)
-            labelStr = "  Band " + RIGHT$(" " + LTRIM$(STR$(band + 1)), 2) + " [" + freqLabels[band] + "] : "
-        ENDIF
-        PRINT labelStr
+        SELECT (band = g_SelectedEqBand AND g_OptionsFocus = 2)
+            CASE 1
+                lblAttr = C_BLACK + (C_CYAN * 16)
+            DEFAULT
+                lblAttr = C_LIGHT_GRAY + (C_BLACK * 16)
+        ENDSELECT
 
-        ' 2. Fixed-Width Value Formatting
-        SetConsolePos(EQ_FORM_X + 22, rowY)
+        labelStr = "  Band " + RIGHT$(" " + LTRIM$(STR$(band + 1)), 2) + " [" + freqLabels[band] + "] : "
+        BufWriteEx(&g_OptionsBuf[0], EQ_FORM_X + 1, rowY, labelStr, lblAttr)
+
+        ' 2. Scaled Integer Math for Sign & Fixed-Width Value Formatting
         gVal = g_EqGains[band]
 
-        IF gVal > 0.01 THEN
-            signStr = "+"
-        ELSEIF gVal < -0.01 THEN
-            signStr = "-"
-        ELSE
-            signStr = " "
-        ENDIF
+        SELECT 1
+            CASE (gVal >= 0.05)
+                iG = INT(gVal * 10.0 + 0.5)
+            CASE (gVal <= -0.05)
+                iG = INT(gVal * 10.0 - 0.5)
+            DEFAULT
+                iG = 0
+        ENDSELECT
 
-        iG = INT(ABS(gVal) * 10.0 + 0.5)
-        whole = iG / 10
-        frac  = iG % 10
+        SELECT 1
+            CASE (iG > 0)
+                signStr = "+"
+                absG = iG
+            CASE (iG < 0)
+                signStr = "-"
+                absG = -iG
+            DEFAULT
+                signStr = " "
+                absG = 0
+        ENDSELECT
 
-        IF whole >= 10 THEN
-            tensStr = LTRIM$(STR$(whole / 10))
-        ELSE
-            tensStr = " "
-        ENDIF
+        whole = absG / 10
+        frac  = absG % 10
+
+        SELECT (whole >= 10)
+            CASE 1
+                tensStr = LTRIM$(STR$(whole / 10))
+            DEFAULT
+                tensStr = " "
+        ENDSELECT
 
         onesStr = LTRIM$(STR$(whole % 10))
         fracStr = LTRIM$(STR$(frac))
 
         valStr = signStr + tensStr + onesStr + "." + fracStr + " dB"
 
-        ' Set Text Colors
-        IF gVal > 0.01 THEN
-            IF (band = g_SelectedEqBand AND g_OptionsFocus = 2) THEN
-                SetColor(C_BLACK + (C_GREEN * 16))
-            ELSE
-                SetColor(C_GREEN)
-            ENDIF
-        ELSEIF gVal < -0.01 THEN
-            IF (band = g_SelectedEqBand AND g_OptionsFocus = 2) THEN
-                SetColor(C_BLACK + (C_RED * 16))
-            ELSE
-                SetColor(C_RED)
-            ENDIF
-        ELSE
-            IF (band = g_SelectedEqBand AND g_OptionsFocus = 2) THEN
-                SetColor(C_BLACK + (C_WHITE * 16))
-            ELSE
-                SetColor(C_WHITE)
-            ENDIF
-        ENDIF
+        ' 3. Color Selection via Integer Scale Match
+        SELECT 1
+            CASE (iG > 0)
+                SELECT (band = g_SelectedEqBand AND g_OptionsFocus = 2)
+                    CASE 1   : valAttr = C_BLACK + (C_GREEN * 16)
+                    DEFAULT : valAttr = C_GREEN + (C_BLACK * 16)
+                ENDSELECT
 
-        PRINT valStr + "  "
+            CASE (iG < 0)
+                SELECT (band = g_SelectedEqBand AND g_OptionsFocus = 2)
+                    CASE 1   : valAttr = C_BLACK + (C_RED * 16)
+                    DEFAULT : valAttr = C_RED + (C_BLACK * 16)
+                ENDSELECT
+
+            DEFAULT
+                SELECT (band = g_SelectedEqBand AND g_OptionsFocus = 2)
+                    CASE 1   : valAttr = C_BLACK + (C_WHITE * 16)
+                    DEFAULT : valAttr = C_WHITE + (C_BLACK * 16)
+                ENDSELECT
+        ENDSELECT
+
+        BufWriteEx(&g_OptionsBuf[0], EQ_FORM_X + 22, rowY, valStr + "  ", valAttr)
     NEXT band
 
-    ' 3. Safety Precut Line Formatting
-    SetConsolePos(EQ_FORM_X, EQ_FORM_Y + 11)
-    SetColor(C_DARK_GRAY)
-    
-    iG = INT(ABS(g_EqPrecut) * 10.0 + 0.5)
-    whole = iG / 10
-    frac  = iG % 10
+    ' 4. Safety Precut Line Formatting via Integer Scale Match
+    iG = INT(g_EqPrecut * 10.0)
 
-    IF g_EqPrecut < -0.01 THEN signStr = "-" ELSE signStr = " "
-    IF whole >= 10 THEN tensStr = LTRIM$(STR$(whole / 10)) ELSE tensStr = " "
+    SELECT 1
+        CASE (iG < 0)
+            signStr = "-"
+            absG = -iG
+        CASE (iG > 0)
+            signStr = "+"
+            absG = iG
+        DEFAULT
+            signStr = " "
+            absG = 0
+    ENDSELECT
+
+    whole = absG / 10
+    frac  = absG % 10
+
+    SELECT (whole >= 10)
+        CASE 1   : tensStr = LTRIM$(STR$(whole / 10))
+        DEFAULT : tensStr = " "
+    ENDSELECT
+
     onesStr = LTRIM$(STR$(whole % 10))
     fracStr = LTRIM$(STR$(frac))
 
     valStr = signStr + tensStr + onesStr + "." + fracStr + " dB"
-    PRINT "Safety Precut Headroom: " + valStr + "  "
-    SetColor(C_LIGHT_GRAY)
+    BufWriteEx(&g_OptionsBuf[0], EQ_FORM_X, EQ_FORM_Y + 11, "Safety Precut Headroom: " + valStr + "  ", C_DARK_GRAY + (C_BLACK * 16))
 ENDSUB
 
 SUB DrawEqResponseGraph()
@@ -2631,9 +2828,10 @@ SUB DrawEqResponseGraph()
     WINRECT crect
     GetClientRect(hWnd, &crect)
 
-    ' Shifted left: matching Columns 40-77, Rows 2-7
+    ' Dynamic DPI-Aware Pixel Layout Math
+    ' Aligned to Columns 40-77, Rows 3-8
     INT posX   = INT(crect.right * (40.0 / 80.0))
-    INT posY   = INT(crect.bottom * (2.0 / 27.0))
+    INT posY   = INT(crect.bottom * (3.0 / 27.0))
     INT graphW = INT(crect.right * (37.0 / 80.0)) - 6
     INT graphH = INT(crect.bottom * (5.5 / 27.0))
 
@@ -2641,6 +2839,13 @@ SUB DrawEqResponseGraph()
         ReleaseDC(hWnd, hDC)
         RETURN
     ENDIF
+
+    ' Scale font size and line widths proportionally with display DPI / height
+    INT fontHeight = -INT(graphH * 0.16)
+    IF fontHeight > -8 THEN fontHeight = -8
+
+    INT curvePenWidth = INT(graphH * 0.04)
+    IF curvePenWidth < 2 THEN curvePenWidth = 2
 
     ' Create Off-Screen Memory DC & Compatible Bitmap
     UINT hMemDC  = CreateCompatibleDC(hDC)
@@ -2657,9 +2862,9 @@ SUB DrawEqResponseGraph()
     DeleteObject(hBlackBrush)
 
     ' ========================================================================
-    ' 2. FONT CREATION: SMALL FONTS (-9 px bitmap size)
+    ' 2. DPI-SCALED FONT CREATION
     ' ========================================================================
-    UINT hGraphFont = CreateFontA(-9, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, "Small Fonts")
+    UINT hGraphFont = CreateFontA(fontHeight, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, "Small Fonts")
     UINT hOldFont   = SelectObject(hMemDC, hGraphFont)
 
     SetBkMode(hMemDC, 1) ' TRANSPARENT background
@@ -2671,11 +2876,11 @@ SUB DrawEqResponseGraph()
     UINT hYellowPen = CreatePen(0, 1, RGB(255, 255, 0))
     UINT hOldPen    = SelectObject(hMemDC, hYellowPen)
 
-    INT axisLeft  = 24
-    INT axisRight = graphW - 8
-    INT axisMidY  = INT(graphH / 2)
-    INT axisTopY  = 6
-    INT axisBotY  = graphH - 12
+    INT axisLeft  = INT(graphW * 0.12)
+    INT axisRight = graphW - INT(graphW * 0.04)
+    INT axisMidY  = INT(graphH * 0.44)
+    INT axisTopY  = INT(graphH * 0.10)
+    INT axisBotY  = graphH - INT(graphH * 0.25)  ' <--- Lifted baseline to fit text
 
     ' Center 0 dB Reference Line
     MoveToEx(hMemDC, axisLeft, axisMidY, 0)
@@ -2687,13 +2892,14 @@ SUB DrawEqResponseGraph()
 
     ' Render Axis Text Labels
     TextOutA(hMemDC, 1, axisTopY - 3, "+12", 3)
-    TextOutA(hMemDC, 8, axisMidY - 4, "0", 1)
-    TextOutA(hMemDC, 2, axisBotY - 4, "-12", 3)
+    TextOutA(hMemDC, INT(axisLeft * 0.3), axisMidY - 4, "0", 1)
+    TextOutA(hMemDC, 1, axisBotY - 4, "-12", 3)
 
-    ' Frequency Labels at Base
-    TextOutA(hMemDC, axisLeft, axisBotY + 1, "31", 2)
-    TextOutA(hMemDC, INT((axisLeft + axisRight) / 2) - 6, axisBotY + 1, "1k", 2)
-    TextOutA(hMemDC, axisRight - 14, axisBotY + 1, "16k", 3)
+    ' Frequency Labels at Base (Tucked comfortably inside bottom margin)
+    INT textY = axisBotY + 2
+    TextOutA(hMemDC, axisLeft, textY, "31", 2)
+    TextOutA(hMemDC, INT((axisLeft + axisRight) / 2) - 6, textY, "1k", 2)
+    TextOutA(hMemDC, axisRight - 14, textY, "16k", 3)
 
     ' ========================================================================
     ' 4. POINT CALCULATION FOR 10 EQ BANDS
@@ -2714,9 +2920,9 @@ SUB DrawEqResponseGraph()
     NEXT i
 
     ' ========================================================================
-    ' 5. CYAN RESPONSE CURVE (RGB 0, 255, 255)
+    ' 5. CYAN RESPONSE CURVE (DPI-SCALED THICKNESS)
     ' ========================================================================
-    UINT hCyanPen = CreatePen(0, 2, RGB(0, 255, 255))
+    UINT hCyanPen = CreatePen(0, curvePenWidth, RGB(0, 255, 255))
     SelectObject(hMemDC, hCyanPen)
 
     Polyline(hMemDC, &curvePts[0], 10)
@@ -3576,12 +3782,17 @@ SUB LoadTrackMetadata(DWORD hStream, INT argIdx)
     g_DispTitle  = g_DispTitleBuf
     g_DispAlbum  = g_DispAlbumBuf
 
-    ' 9. Clear shadow buffers so FlushTopHUD & FlushExtendedRegion force a conhost redraw
+    ' 9. Clear shadow buffers so FlushTopHUD & 
+    ' & FlushExtendedRegion force a conhost redraw
     RtlZeroMemory(&g_PrevTopBuf, 4160)
     RtlZeroMemory(&g_PrevExtBuf, 3520)
     
     ' Force lyric/metadata frame dirty flag
     g_LastActiveLyric = -2
+
+    ' Reset Coverart ticker
+    g_CoverFrameTick = 0
+
 ENDSUB
 
 SUB TruncatePathSmart(STRING fullPath, INT maxLen), STRING
@@ -4118,7 +4329,7 @@ gdiInput.DebugEventCallback = 0
 gdiInput.SuppressBackgroundThread = 0
 gdiInput.SuppressExternalCodecs = 0
 GdiplusStartup(&gdiToken, &gdiInput, 0)
-
+SetProcessDPIAware()
 cliArgCount = argc()
 cliArg = GetCommandText()
 
@@ -4144,7 +4355,7 @@ IF cliArgCount > 2 OR cliArg = "" THEN
     PRINT " (-/    (-|__) (-|     (-/_| (-\_/  "
     PRINT "  _\__,  _|     _|__,  _/  |,  _|,  "
     PRINT " (      (      (      (       (     "
-    PRINT " Fast Console Audio Player      v2.1"
+    PRINT " Fast Console Audio Player      v2.5"
     PRINT " (c) Y. Dalissier"
     PRINT ""
     PRINT "Usage:"
@@ -4354,10 +4565,13 @@ WHILE argIdx < g_TrackCount
                     ENDIF
                     DrawVerticalMeterBuf(lLevel, rLevel, 73, 2, 10)
 
-                    ' 4. Flush Region 1 (Top HUD/VU Meters) - Skipped if identical / paused
+                    ' 4. Write updated telemetry into g_FrameBuf (Rows 25 & 26)
+                    DrawBottomTelemetryBuf()
+
+                    ' 5. Flush Region 1 (Top HUD/VU Meters) - Skipped if identical / paused
                     FlushTopHUD(g_hConsole)
 
-                    ' 5. Process Zero-Allocation Marquee Tick
+                    ' 6. Process Zero-Allocation Marquee Tick
                     INT extNeedsFlush = 0
                     marqueeTick = marqueeTick + 1
                     IF marqueeTick >= MARQUEE_SPEED_DIV THEN
@@ -4381,7 +4595,7 @@ WHILE argIdx < g_TrackCount
                         extNeedsFlush = 1
                     ENDIF
 
-                    ' 6. Render Extended Display (Flush Region 2 ONLY on lyric line step or marquee tick)
+                    ' 7. Render Extended Display (Flush Region 2 ONLY on lyric line step or marquee tick)
                     INT lyrChanged = 0
                     IF g_ExtDisplay = 2 AND g_IsSyncedLyrics = 1 THEN
                         INT curLyricIdx = -1, lIdx
@@ -4396,7 +4610,7 @@ WHILE argIdx < g_TrackCount
                         FlushExtendedRegion(g_hConsole)
                     ENDIF
 
-                    ' 7. Window Restoration Cover Art Check
+                    ' 8. Window Restoration Cover Art Check
                     UINT conHwnd = GetConsoleWindow()
                     IF IsIconic(conHwnd) <> 0 THEN
                         wasMinimized = 1
@@ -5037,9 +5251,13 @@ BASS_ChannelPlay(hStream, 0)
 
             ENDSELECT
 
-            ' Would you please render the coverart anyway ?
-            RenderCoverArtFast()
 
+            ' Would you please render the coverart anyway ?
+            g_CoverFrameTick = g_CoverFrameTick + 1
+            IF g_CoverFrameTick >= 500 THEN
+               g_CoverFrameTick = 0
+               RenderCoverArtFast()
+            ENDIF
             ' thank you.
 
             ' Volume Normalization
