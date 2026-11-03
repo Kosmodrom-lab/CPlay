@@ -135,11 +135,20 @@ INT g_PlaylistScrollOffset    = 0   ' Top visible row in viewport
 INT g_ManualJump              = 0   ' 1 = Manual track selection from Browser
 QWORD g_TotalPlaylistSeconds  = 0q  ' Total runtime accumulator
 INT g_SearchDebounceTick      = 0   ' Tracks tick delay for debounced search
+INT g_BrMode                  = 0   ' 0 files, 1 artists, 2 albums, 3 tracks of one album
+INT g_RowKind                 = 0   ' what the filtered list holds (see above); set by FilterPlaylist
+INT g_BrSearchRes             = 0   ' 1 = the list is a library search result
+INT g_BrArtist                = -1  ' artist number being browsed (modes 2 and 3)
+INT g_BrAlbum                 = -1  ' album number being browsed (mode 3)
+INT g_BrSelArt                = 0   ' list position to restore when going one level up
+INT g_BrSelAlb                = 0
+INT plTabPushed               = 0
 
 TYPE CHAR_INFO
     WORD BufChar
     WORD Attributes
 ENDTYPE
+
 
 ' --- DIRECT VIDEO MEMORY BLITTING BUFFERS (80x27) ---
 CHAR_INFO g_FrameBuf[2160]
@@ -152,6 +161,11 @@ CHAR_INFO g_PlaylistBuf[2160]
 CHAR_INFO g_OptionsBuf[2160]
 CHAR_INFO g_MoreOptionsBuf[2160]
 
+HANDLE    hHelpBuffer = 0
+CHAR_INFO g_HelpBuf[2160]
+INT       f1Down      = 0
+INT       homeDown    = 0
+INT       g_DigitDown[10]
 
 ' Cover Art
 UINT g_hCoverBmp   = 0
@@ -346,6 +360,7 @@ DWORD hStream
 POINTER pTrack
 DWORD g_hNextStream      = 0    ' Secondary background stream handle
 INT   g_PreloadDone      = 0    ' 1 = Next track already opened in RAM
+INT   g_NextSource       = 0    ' 0 = new pick, 1 = history forward, 2 = priority queue
 INT   g_NextTrackIdx     = -1   ' Playlist index of preloaded track
 DWORD g_hOldFadingStream = 0
 
@@ -368,6 +383,56 @@ INT skipTrack
 BASS_CHANNELINFO g_chanInfo
 DWORD vuLevel
 INT lLevel, rLevel
+
+' --- Spectrum analyzer ---
+DWORD g_SpecFftFlag = 0x80000002
+INT   g_SpecFftBins = 1024        ' floats returned by an FFT2048 (= FFT size / 2)
+CONST SPEC_BARS     = 20
+FLOAT  g_FFTData[4096]
+DOUBLE g_SpecLvl[20]          ' bar heights in HALF rows, 0..20
+DWORD  g_SpecLastTick = 0
+
+' --- ReplayGain ---
+INT    g_RGMode      = 0      ' 0 = off, 1 = track gain, 2 = album gain (falls back to track gain)
+INT    g_RGPreampDb  = 0      ' whole dB added to the tag gain (edit "rg_preamp=" in cplay.ini)
+DOUBLE g_RGTrackDb   = 0.0
+DOUBLE g_RGAlbumDb   = 0.0
+INT    g_RGHasTrack  = 0
+INT    g_RGHasAlbum  = 0
+INT    g_ParseOK     = 0
+
+' ---- Library GLOBALS ----
+CONST LIB_BLOB_BYTES = 16777216          ' 16 MB text pool (50,000 tracks need roughly 8 MB)
+POINTER g_LibBlob = 0
+POINTER g_TagBuf  = 0
+POINTER g_Scratch = 0         ' Scratch buffer to build full TAG string
+INT g_LibBlobUsed = 1
+INT g_LibArtOff[MAX_PLAYLIST], g_LibAlbOff[MAX_PLAYLIST], g_LibTitOff[MAX_PLAYLIST]
+INT g_LibTrk[MAX_PLAYLIST], g_LibDone[MAX_PLAYLIST]
+INT g_LibScanned = 0
+INT g_LibActive  = 0
+STRING g_TagArt, g_TagAlb, g_TagTit
+INT g_TagTrk = 0
+INT g_LibDirty = 0
+INT g_LibOrder[MAX_PLAYLIST]          ' playlist indices sorted by artist, album, track no., title
+INT g_LibOrderCount = 0
+INT g_ArtFirst[100000]                ' position in g_LibOrder where artist k starts; [g_ArtCount] = sentinel
+INT g_ArtCount = 0
+INT g_AlbFirst[100000]                ' same, for the albums of ONE artist (see LibBuildAlbums)
+INT g_AlbCount = 0
+INT g_AlbArtist = -1
+INT g_LibIndexBuilt = 0
+INT g_LibIndexBuiltFor = -1
+STRING g_PrevArt, g_PrevAlb
+INT g_PrevArtOff = 0, g_PrevAlbOff = 0
+INT g_SrArt = 0, g_SrAlb = 0, g_SrSong = 0      ' how many of each in the current result list
+' g_RowKind gets a new value:  4 = mixed search results. Item code = type * 10000000 + value
+' type 1: value = artist number | type 2: value = position in g_LibOrder of the album's first 
+' track | type 3: value = playlist index
+
+' ---- RAM Buffer for File Write ----
+POINTER g_OutBuf = 0
+INT g_OutLen = 0, g_OutCap = 0
 
 ' ----------------------------------------------------------------------------
 ' Fast Math Estimator & Duration Helpers
@@ -449,6 +514,7 @@ SUB InitConsoleScreen()
     hOptionsBuffer     = CreateConsoleScreenBuffer(0xC0000000, 3, 0, 1, 0)
     hMoreOptionsBuffer = CreateConsoleScreenBuffer(0xC0000000, 3, 0, 1, 0)
     hPlaylistBuffer    = CreateConsoleScreenBuffer(0xC0000000, 3, 0, 1, 0)
+    hHelpBuffer        = CreateConsoleScreenBuffer(0xC0000000, 3, 0, 1, 0)
 
     COORD newSize
     newSize.X = 80 : newSize.Y = 27
@@ -495,6 +561,13 @@ SUB InitConsoleScreen()
         SetConsoleScreenBufferSize(hPlaylistBuffer, newSize)
         SetConsoleWindowInfo(hPlaylistBuffer, 1, &maxRect)
     ENDIF
+
+         IF hHelpBuffer <> -1 AND hHelpBuffer <> 0 THEN
+             SetConsoleCursorInfo(hHelpBuffer, &cInfo)
+             SetConsoleWindowInfo(hHelpBuffer, 1, &minRect)
+             SetConsoleScreenBufferSize(hHelpBuffer, newSize)
+             SetConsoleWindowInfo(hHelpBuffer, 1, &maxRect)
+         ENDIF
 ENDSUB
 
 SUB RestoreConsoleScreen()
@@ -505,8 +578,93 @@ SUB RestoreConsoleScreen()
         IF hOptionsBuffer <> 0 AND hOptionsBuffer <> -1 THEN CloseHandle(hOptionsBuffer) : hOptionsBuffer = 0
         IF hMoreOptionsBuffer <> 0 AND hMoreOptionsBuffer <> -1 THEN CloseHandle(hMoreOptionsBuffer) : hMoreOptionsBuffer = 0
         IF hPlaylistBuffer <> 0 AND hPlaylistBuffer <> -1 THEN CloseHandle(hPlaylistBuffer) : hPlaylistBuffer = 0
+        IF hHelpBuffer <> 0 AND hHelpBuffer <> -1 THEN CloseHandle(hHelpBuffer) : hHelpBuffer = 0
         g_hConsole = g_hStdOut
     ENDIF
+ENDSUB
+
+SUB DiscardPreload()
+    IF g_hNextStream <> 0 THEN
+        BASS_StreamFree(g_hNextStream)
+        g_hNextStream = 0
+    ENDIF
+    g_PreloadDone  = 0
+    g_NextTrackIdx = -1
+ENDSUB
+
+' Bookkeeping the dispatcher normally does, for gapless/crossfade swaps
+SUB CommitNextTrack(INT newIdx)
+    IF newIdx < 0 OR newIdx >= g_TrackCount THEN RETURN
+
+    IF g_Played[newIdx] = 0 THEN
+        g_Played[newIdx] = 1
+        g_PlayedCount = g_PlayedCount + 1
+    ENDIF
+
+    SELECT g_NextSource
+        CASE 2
+            g_PriorityIdx = g_PriorityIdx + 1
+            IF g_PriorityIdx >= g_PriorityCount THEN
+                g_PriorityIdx   = -1
+                g_PriorityCount = 0
+            ENDIF
+            IF g_HistoryPos < MAX_PLAYLIST - 1 THEN
+                g_HistoryMax = g_HistoryPos + 1
+                g_HistoryPos = g_HistoryMax
+                g_History[g_HistoryPos] = newIdx
+            ENDIF
+        CASE 1
+            g_HistoryPos = g_HistoryPos + 1
+        DEFAULT
+            IF g_HistoryMax < MAX_PLAYLIST - 1 THEN
+                g_HistoryMax = g_HistoryMax + 1
+                g_HistoryPos = g_HistoryMax
+                g_History[g_HistoryPos] = newIdx
+            ENDIF
+    ENDSELECT
+ENDSUB
+
+' Single source of truth for "what plays next"
+' Same rules as the post-playback dispatcher, but without side effects.
+SUB PeekNextTrack(INT currentIdx), INT
+    INT idx, target, curUnplayed, remaining
+    g_NextSource = 0
+
+    ' 1. [P]lay All Filtered queue wins
+    IF g_PriorityIdx >= 0 AND g_PriorityIdx < g_PriorityCount THEN
+        g_NextSource = 2
+        RETURN g_PriorityQueue[g_PriorityIdx]
+    ENDIF
+
+    ' 2. Walking forward through the history stack (after [P]revious)
+    IF g_HistoryPos < g_HistoryMax THEN
+        g_NextSource = 1
+        RETURN g_History[g_HistoryPos + 1]
+    ENDIF
+
+    ' 3. Everything played -> let the list end like the dispatcher does
+    IF g_PlayedCount >= g_TrackCount THEN RETURN -1
+
+    IF g_Shuffle = 1 THEN
+        remaining   = g_TrackCount - g_PlayedCount
+        target      = INT(RND(remaining)) + 1
+        curUnplayed = 0
+        FOR idx = 0 TO g_TrackCount - 1
+            IF LEN(g_Playlist[idx]) > 0 AND g_Played[idx] = 0 THEN
+                curUnplayed = curUnplayed + 1
+                IF curUnplayed = target THEN RETURN idx
+            ENDIF
+        NEXT idx
+        RETURN -1
+    ENDIF
+
+    ' Linear: next unplayed track after the current one (no wrap-around)
+    idx = currentIdx + 1
+    WHILE idx < g_TrackCount AND (g_Played[idx] = 1 OR LEN(g_Playlist[idx]) = 0)
+        idx = idx + 1
+    ENDWHILE
+    IF idx >= g_TrackCount THEN RETURN -1
+    RETURN idx
 ENDSUB
 
 SUB GetMarqueeSlice(POINTER pRingStr, INT periodLen, INT offset, INT dispLen, POINTER pOutBuf)
@@ -969,15 +1127,8 @@ ENDSUB
 SUB UpdateBASSBand(INT bandIdx)
     ' Guard against uninitialized stream or invalid band index
     IF hStream = 0 OR bandIdx < 0 OR bandIdx > 9 THEN RETURN
-    IF g_hEqFX[bandIdx] = 0 THEN RETURN
-
-    BASS_DX8_PARAMEQ eqParams
-
-    ' Retrieve current band parameters, adjust gain using native IWBasic float() casting
-    IF BASS_FXGetParameters(g_hEqFX[bandIdx], &eqParams) <> 0 THEN
-        eqParams.fGain = float(g_EqGains[bandIdx] - g_EqPrecut)
-        BASS_FXSetParameters(g_hEqFX[bandIdx], &eqParams)
-    ENDIF
+    IF g_EqEnabled = 0 THEN RETURN
+    SetEqBandFX(hStream, bandIdx)
 ENDSUB
 
 SUB UpdateStreamVolume(DWORD hStreamHandle)
@@ -994,8 +1145,13 @@ SUB UpdateStreamVolume(DWORD hStreamHandle)
         effVol = effVol * scaleFactor
     ENDIF
 
+   ' 1b. ReplayGain: tag gain + preamp as a linear factor on the channel volume
+   IF RGIsActive() = 1 THEN
+       effVol = effVol * (10.0 ^ (GetReplayGainDb() / 20.0))
+   ENDIF
+
     ' 2. Apply Dynamic Normalization Boost / Attenuation
-    IF g_NormEnabled = 1 THEN
+    IF g_NormEnabled = 1 AND RGIsActive() = 0 THEN
         DWORD level = BASS_ChannelGetLevel(hStreamHandle)
         IF level <> -1 AND level > 0 THEN
             INT leftPeak  = level & 0xFFFF
@@ -1014,11 +1170,44 @@ SUB UpdateStreamVolume(DWORD hStreamHandle)
         ENDIF
     ENDIF
 
-    INT finalVol = INT(effVol)
+    INT finalVol = INT(effVol + 0.5)
     IF finalVol < 0 THEN finalVol = 0
     IF finalVol > 100 THEN finalVol = 100
 
     BASS_ChannelSetAttributes(hStreamHandle, curFreq, finalVol, curPan)
+ENDSUB
+
+' One band, handle stored AT THE BAND INDEX
+SUB SetEqBandFX(DWORD hStreamHandle, INT band)
+    IF hStreamHandle = 0 OR band < 0 OR band > 9 THEN RETURN
+
+    FLOAT fG = g_EqGains[band]
+    IF fG < -15.0 THEN fG = -15.0
+    IF fG > 15.0 THEN fG = 15.0
+
+    BASS_DX8_PARAMEQ eqParams
+
+    IF g_hEqFX[band] = 0 THEN
+        ' Flat bands get no filter until the user moves them
+        IF ABS(fG) <= 0.1 THEN RETURN
+
+        g_hEqFX[band] = BASS_ChannelSetFX(hStreamHandle, BASS_FX_DX8_PARAMEQ, 0)
+        IF g_hEqFX[band] = 0 THEN RETURN
+
+        FLOAT fC = g_EqFreqs[band]
+        IF fC < 80.0 THEN fC = 80.0
+        IF fC > 16000.0 THEN fC = 16000.0
+
+        eqParams.fCenter    = fC
+        eqParams.fBandwidth = 12.0 ' 1-Octave bandwidth
+        eqParams.fGain      = fG
+        BASS_FXSetParameters(g_hEqFX[band], &eqParams)
+    ELSE
+        IF BASS_FXGetParameters(g_hEqFX[band], &eqParams) <> 0 THEN
+            eqParams.fGain = fG
+            BASS_FXSetParameters(g_hEqFX[band], &eqParams)
+        ENDIF
+    ENDIF
 ENDSUB
 
 SUB ApplyEqProfile(DWORD hStreamHandle)
@@ -1037,39 +1226,15 @@ SUB ApplyEqProfile(DWORD hStreamHandle)
     FOR i = 0 TO 9
         IF g_EqGains[i] > maxBoost THEN maxBoost = g_EqGains[i]
     NEXT i
-    
+
     IF g_EqPrecut = 0.0 AND maxBoost > 0.0 THEN
         g_EqPrecut = -maxBoost
     ENDIF
 
     UpdateStreamVolume(hStreamHandle)
 
-    BASS_DX8_PARAMEQ eqParams
-    INT fxCount = 0
-
     FOR i = 0 TO 9
-        FLOAT fG = g_EqGains[i]
-        
-        ' Clamp Gain (-15.0 dB to +15.0 dB)
-        IF fG < -15.0 THEN fG = -15.0
-        IF fG > 15.0 THEN fG = 15.0
-
-        ' Only attach DX8 FX handle when gain is non-zero
-        IF ABS(fG) > 0.1 THEN
-            g_hEqFX[fxCount] = BASS_ChannelSetFX(hStreamHandle, BASS_FX_DX8_PARAMEQ, 0)
-            IF g_hEqFX[fxCount] <> 0 THEN
-                FLOAT fC = g_EqFreqs[i]
-                IF fC < 80.0 THEN fC = 80.0
-                IF fC > 16000.0 THEN fC = 16000.0
-
-                eqParams.fCenter    = fC
-                eqParams.fBandwidth = 12.0 ' 1-Octave bandwidth
-                eqParams.fGain      = fG
-
-                BASS_FXSetParameters(g_hEqFX[fxCount], &eqParams)
-                fxCount = fxCount + 1
-            ENDIF
-        ENDIF
+        SetEqBandFX(hStreamHandle, i)
     NEXT i
 ENDSUB
 
@@ -1082,57 +1247,30 @@ SUB ApplyAudioAttributes(DWORD hStream)
     BASS_ChannelSetAttributes(hStream, -1, -1, g_Balance)
 ENDSUB
 
+' g_PreloadDone now means "attempted" (also set when there is nothing to preload),
+' so a failed/empty preload is not retried on every frame.
 SUB PreloadNextTrack(INT currentIdx)
-    ' ' Trace("PreloadNextTrack: Triggered for currentIdx = " + LTRIM$(STR$(currentIdx)))
-
-    IF g_hNextStream <> 0 THEN
-        ' ' Trace("PreloadNextTrack: Freeing previous secondary stream handle " + LTRIM$(STR$(g_hNextStream)))
-        BASS_StreamFree(g_hNextStream)
-        g_hNextStream = 0
-    ENDIF
-
-    g_PreloadDone = 0
+    DiscardPreload()
+    g_PreloadDone = 1
     IF g_TrackCount <= 1 THEN RETURN
 
-    IF g_Shuffle = 1 THEN
-        IF g_PlayedCount >= g_TrackCount THEN RETURN
+    INT nextIdx = PeekNextTrack(currentIdx)
+    IF nextIdx < 0 OR nextIdx >= g_TrackCount THEN RETURN
 
-        INT unplayedRem = g_TrackCount - g_PlayedCount
-        IF unplayedRem <= 0 THEN RETURN
-
-        INT targetPick  = INT(RND(unplayedRem)) + 1
-        INT curUnplayed = 0, pScan = 0
-
-        WHILE pScan < g_TrackCount
-            IF LEN(g_Playlist[pScan]) > 0 THEN
-                IF g_Played[pScan] = 0 THEN
-                    curUnplayed = curUnplayed + 1
-                    IF curUnplayed = targetPick THEN
-                        g_NextTrackIdx = pScan
-                        pScan = g_TrackCount
-                    ENDIF
-                ENDIF
-            ENDIF
-            pScan = pScan + 1
-        ENDWHILE
-    ELSE
-        g_NextTrackIdx = currentIdx + 1
-        IF g_NextTrackIdx >= g_TrackCount THEN g_NextTrackIdx = 0
-    ENDIF
-
-    ' ' Trace("PreloadNextTrack: Next track index = " + LTRIM$(STR$(g_NextTrackIdx)) + " | Path = " + g_Playlist[g_NextTrackIdx])
-
-    g_hNextStream = CreateTrackStream(g_Playlist[g_NextTrackIdx])
-    IF g_hNextStream <> 0 THEN g_PreloadDone = 1
+    g_NextTrackIdx = nextIdx
+    g_hNextStream  = CreateTrackStream(g_Playlist[g_NextTrackIdx])
 ENDSUB
 
 SUB GetCalculatedVolume(), INT
     DOUBLE effVol = g_Volume
     IF g_EqEnabled = 1 AND g_EqPrecut < 0.0 THEN
         DOUBLE scaleFactor = 10.0 ^ (g_EqPrecut / 20.0)
-        effVol = g_Volume * scaleFactor
+        effVol = effVol * scaleFactor
     ENDIF
-    INT finalVol = INT(effVol)
+    IF RGIsActive() = 1 THEN
+        effVol = effVol * (10.0 ^ (GetReplayGainDb() / 20.0))
+    ENDIF
+    INT finalVol = INT(effVol + 0.5)
     IF finalVol < 0 THEN finalVol = 0
     IF finalVol > 100 THEN finalVol = 100
     RETURN finalVol
@@ -1166,6 +1304,53 @@ SUB CreateTrackStream(STRING filePath), DWORD
     RETURN newStream
 ENDSUB
 
+' Check if the stream is stereo
+SUB IsStereoStream(DWORD hStreamHandle), INT
+    IF BASS_ChannelGetInfo(hStreamHandle, &g_chanInfo) = 0 THEN RETURN 0
+    IF g_chanInfo.chans = 2 THEN RETURN 1
+    RETURN 0
+ENDSUB
+
+' Switch to Mono stream
+SUB ToggleMonoDownmix()
+    g_MonoDownmix = 1 - g_MonoDownmix
+    RebuildCurrentStream()
+ENDSUB
+
+' Rebuild the current stream (new mono/stereo format) and keep the TIME
+SUB RebuildCurrentStream()
+    IF hStream = 0 OR argIdx >= g_TrackCount THEN RETURN
+
+    BASS_ChannelGetInfo(hStream, &g_chanInfo)
+    INT oldFreq = g_chanInfo.freq, oldChans = g_chanInfo.chans
+    QWORD oldPos = BASS_ChannelGetPosition(hStream)
+    DOUBLE secs = 0.0
+    IF oldFreq > 0 AND oldChans > 0 THEN secs = oldPos / (oldFreq * oldChans * 2.0)
+
+    INT wasPlaying = 0
+    IF BASS_ChannelIsActive(hStream) = BASS_ACTIVE_PLAYING THEN wasPlaying = 1
+
+    BASS_ChannelStop(hStream)
+    BASS_StreamFree(hStream)
+    hStream = 0
+    DiscardPreload()
+
+    hStream = CreateTrackStream(g_Playlist[argIdx])
+    IF hStream = 0 THEN RETURN
+
+    BASS_ChannelGetInfo(hStream, &g_chanInfo)
+    ApplyAllDSP(hStream)
+
+    QWORD newPos = secs * (g_chanInfo.freq * g_chanInfo.chans * 2.0)
+    BASS_ChannelSetPosition(hStream, newPos)
+
+    ' Play first, then pause: a never-started stream is STOPPED and would end the track loop
+    BASS_ChannelPlay(hStream, 0)
+    IF wasPlaying = 0 THEN BASS_ChannelPause(hStream)
+
+    LoadTrackMetadata(hStream, argIdx)    ' refreshes the Stereo/Mono label
+ENDSUB
+
 SUB CheckStreamTransition(POINTER phStream, POINTER pargIdx)
     DWORD hStream = #<DWORD>phStream
     INT argIdx    = #<INT>pargIdx
@@ -1180,9 +1365,11 @@ SUB CheckStreamTransition(POINTER phStream, POINTER pargIdx)
         ENDIF
     ENDIF
 
+    INT act = BASS_ChannelIsActive(hStream)
+
     totalLenBytes   = BASS_ChannelGetLength(hStream)
     currentPosBytes = BASS_ChannelGetPosition(hStream)
-    
+
     ' Accurate time calculation via channel sample rate & channels
     BASS_ChannelGetInfo(hStream, &g_chanInfo)
     DOUBLE totalS = 0.0, currentS = 0.0, remainS = 0.0
@@ -1202,10 +1389,12 @@ SUB CheckStreamTransition(POINTER phStream, POINTER pargIdx)
         PreloadNextTrack(argIdx)
     ENDIF
 
-    ' 2. Overlapped Dual-Stream Crossfade Transition
-    IF g_Crossfade > 0 AND g_hNextStream <> 0 AND remainS <= crossfadeSecs AND remainS > 0.0 THEN
+    ' 2. Overlapped Dual-Stream Crossfade Transition (never while paused)
+    IF g_Crossfade > 0 AND act = BASS_ACTIVE_PLAYING AND g_hNextStream <> 0 AND remainS <= crossfadeSecs AND remainS > 0.0 THEN
         DWORD hOldStream = hStream
         DWORD hNewStream = g_hNextStream
+        INT newIdx       = g_NextTrackIdx
+        ReadReplayGain(hNewStream)
         INT targetVol    = GetCalculatedVolume()
         INT slideMs      = INT(remainS * 1000.0)
         IF slideMs < 100 THEN slideMs = 100
@@ -1228,23 +1417,22 @@ SUB CheckStreamTransition(POINTER phStream, POINTER pargIdx)
         ENDIF
 
         #<DWORD>phStream = hNewStream
-        #<INT>pargIdx    = g_NextTrackIdx
+        #<INT>pargIdx    = newIdx
 
-        ' Lock played state before metadata extraction
-        IF g_Played[g_NextTrackIdx] = 0 THEN
-            g_Played[g_NextTrackIdx] = 1
-            g_PlayedCount = g_PlayedCount + 1
-        ENDIF
+        ' Played flag + history + priority queue, exactly as the dispatcher would do
+        CommitNextTrack(newIdx)
 
         g_hNextStream = 0
         g_PreloadDone = 0
 
-        LoadTrackMetadata(hNewStream, g_NextTrackIdx)
+        LoadTrackMetadata(hNewStream, newIdx)
         RedrawCurrentScreen()
 
-    ' 3. Standard Zero-Delay Gapless Handoff
-    ELSEIF (remainS <= 0.08 OR BASS_ChannelIsActive(hStream) <> BASS_ACTIVE_PLAYING) THEN
+    ' 3. Standard Gapless Handoff: end of stream reached (or ~80 ms left while PLAYING)
+    ELSEIF (act = BASS_ACTIVE_PLAYING AND remainS <= 0.08) OR act = BASS_ACTIVE_STOPPED THEN
         IF g_Gapless = 1 AND g_hNextStream <> 0 THEN
+            INT nextIdx = g_NextTrackIdx
+
             BASS_ChannelStop(hStream)
             BASS_StreamFree(hStream)
 
@@ -1256,17 +1444,13 @@ SUB CheckStreamTransition(POINTER phStream, POINTER pargIdx)
             ENDIF
 
             #<DWORD>phStream = g_hNextStream
-            #<INT>pargIdx    = g_NextTrackIdx
+            #<INT>pargIdx    = nextIdx
 
-            ' Lock played state before metadata extraction
-            IF g_Played[g_NextTrackIdx] = 0 THEN
-              g_Played[g_NextTrackIdx] = 1
-              g_PlayedCount = g_PlayedCount + 1
-            ENDIF
+            CommitNextTrack(nextIdx)
 
             hStream = g_hNextStream
-            argIdx  = g_NextTrackIdx
-
+            argIdx  = nextIdx
+            ReadReplayGain(hStream)
             g_hNextStream = 0
             g_PreloadDone = 0
 
@@ -1485,7 +1669,9 @@ SUB ApplyStereoWidener(DWORD hStreamHandle)
         g_hWidenerDSP = 0
     ENDIF
     IF g_WidenerEnabled = 1 THEN
-        g_hWidenerDSP = BASS_ChannelSetDSP(hStreamHandle, &StereoWidenerDSP, 0, 0)
+        IF IsStereoStream(hStreamHandle) = 1 THEN
+            g_hWidenerDSP = BASS_ChannelSetDSP(hStreamHandle, &StereoWidenerDSP, 0, 0)
+        ENDIF
     ENDIF
 ENDSUB
 
@@ -1496,11 +1682,13 @@ SUB ApplyCrossfeed(DWORD hStreamHandle)
         g_hCrossfeedDSP = 0
     ENDIF
     IF g_CrossfeedEnabled = 1 THEN
-        ' Reset history buffers
-        RtlZeroMemory(&g_XFeedHistL[0], 64)
-        RtlZeroMemory(&g_XFeedHistR[0], 64)
-        g_XFeedIdx = 0
-        g_hCrossfeedDSP = BASS_ChannelSetDSP(hStreamHandle, &CrossfeedDSP, 0, 0)
+        IF IsStereoStream(hStreamHandle) = 1 THEN
+            ' Reset history buffers
+            RtlZeroMemory(&g_XFeedHistL[0], 64)
+            RtlZeroMemory(&g_XFeedHistR[0], 64)
+            g_XFeedIdx = 0
+            g_hCrossfeedDSP = BASS_ChannelSetDSP(hStreamHandle, &CrossfeedDSP, 0, 0)
+        ENDIF
     ENDIF
 ENDSUB
 
@@ -1510,7 +1698,7 @@ SUB ApplyAgcSmoothed(DWORD hStreamHandle)
         BASS_ChannelRemoveDSP(hStreamHandle, g_hAgcDSP)
         g_hAgcDSP = 0
     ENDIF
-    IF g_NormEnabled = 1 THEN
+    IF g_NormEnabled = 1 AND RGIsActive() = 0 THEN
         ' Only reset smoothing to unity gain when a new track starts
         IF g_AgcResetOnNextApply = 1 THEN
             g_AgcCurrentGain = 1.0
@@ -2030,37 +2218,6 @@ SUB GetWideString(STRING cinstr), POINTER
     RETURN pWideRaw
 ENDSUB
 
-SUB NormalizeToNFC(STRING NinStr), STRING
-    ' Convert string to UTF-16 WideChar
-    INT wLen = MultiByteToWideChar(65001, 0, NinStr, -1, 0, 0)
-    IF wLen <= 0 THEN wLen = MultiByteToWideChar(0, 0, NinStr, -1, 0, 0)
-    IF wLen <= 0 THEN RETURN NinStr
-
-    POINTER pWideSrc = NEW(CHAR, wLen * 2)
-    MultiByteToWideChar(65001, 0, NinStr, -1, pWideSrc, wLen)
-
-    ' Query required destination buffer size for NFC conversion
-    INT normLen = NormalizeString(NormalizationC, pWideSrc, wLen, 0, 0)
-    IF normLen <= 0 THEN
-        DELETE pWideSrc
-        RETURN NinStr
-    ENDIF
-
-    POINTER pWideDst = NEW(CHAR, normLen * 2)
-    NormalizeString(NormalizationC, pWideSrc, wLen, pWideDst, normLen)
-    DELETE pWideSrc
-
-    ' Convert normalized UTF-16 back to ANSI
-    INT aLen = WideCharToMultiByte(0, 0, pWideDst, normLen, 0, 0, 0, 0)
-    POINTER pAnsiDst = NEW(CHAR, aLen)
-    WideCharToMultiByte(0, 0, pWideDst, normLen, pAnsiDst, aLen, 0, 0)
-    DELETE pWideDst
-
-    STRING result = #<STRING>pAnsiDst
-    DELETE pAnsiDst
-    RETURN result
-ENDSUB
-
 SUB ConvertANSItoOEM(STRING cinstr), STRING
     INT inLen = LEN(cinstr)
     IF inLen = 0 THEN RETURN ""
@@ -2318,21 +2475,13 @@ SUB SwitchToPlaylistView()
         ' Reset search prompt & populate initial index map
         g_SearchBuf = ""
         g_SearchActive = 0
+        IF g_BrMode <> 0 THEN BrEnsure()
         plMarqueeOffset = 0
         plMarqueeTick = 0
         FilterPlaylist()
 
         ' Sync focus cursor to currently playing track
-        INT i
-        FOR i = 0 TO g_FilteredCount - 1
-            IF g_FilteredIndices[i] = argIdx THEN
-                g_PlaylistSelectIdx = i
-                BREAK
-            ENDIF
-        NEXT i
-
-        g_PlaylistScrollOffset = g_PlaylistSelectIdx - 9
-        IF g_PlaylistScrollOffset < 0 THEN g_PlaylistScrollOffset = 0
+        BrSyncPlaying()
 
         ' Initialize marquee buffer for currently focused track
         InitPlMarqueeRing()
@@ -2342,47 +2491,53 @@ ENDSUB
 
 SUB DrawPlaylistScreen()
     INT visibleCount = 19
-    INT i, realIdx, rowY, isPlSelected
-    STRING trackName, trackLine, numPrefix, playingTag, dispName, headerStr, timeInfo
+    INT i, realIdx, rowY, isPlSelected, isPlayingRow
+    STRING trackLine, numPrefix, playingTag, dispName, headerStr, timeInfo
 
-    ' 1. Calculate Pagination Math
     INT totalPages = (g_FilteredCount + visibleCount - 1) / visibleCount
     IF totalPages < 1 THEN totalPages = 1
     INT currentPage = (g_PlaylistSelectIdx / visibleCount) + 1
 
-    ' Clear matrix array before populating frame
     FOR i = 0 TO 2159
         g_PlaylistBuf[i].BufChar = 32
         g_PlaylistBuf[i].Attributes = C_BLACK + (C_BLACK * 16)
     NEXT i
 
-    ' --- 2. Top Header Banner (Row 0 & 1) ---
-    IF g_SearchActive = 0 AND g_SearchBuf = "" THEN
+    ' --- Header ---
+    IF g_RowKind = 0 AND g_SearchActive = 0 AND g_SearchBuf = "" THEN
         timeInfo = " " + CHR$(179) + " Total: " + FormatTotalDuration()
     ELSE
         timeInfo = ""
     ENDIF
 
-    headerStr = STRING$(2, 196) + "[ BROWSE PLAYLIST (" + LTRIM$(STR$(g_FilteredCount)) + " Tracks " + CHR$(179) + " Pg " + _
+    headerStr = STRING$(2, 196) + "[ " + BrTitle() + " (" + LTRIM$(STR$(g_FilteredCount)) + " " + CHR$(179) + " Pg " + _
 LTRIM$(STR$(currentPage)) + "/" + LTRIM$(STR$(totalPages)) + timeInfo + ") ]"
-
     headerStr = LEFT$(headerStr + STRING$(80, 196), 80)
 
-    ' Write Header to Matrix
     BufWriteEx(&g_PlaylistBuf[0], 0, 0, headerStr, colVu + (colStatic * 16))
-    ' Separator
     BufWriteEx(&g_PlaylistBuf[0], 0, 1, STRING$(80, 196), colStatic + (C_BLACK * 16))
 
-    ' --- 3. Visible Viewport Item Rendering (Rows 2 to 20 = 19 Tracks) ---
+    ' --- Rows 2..20 ---
     INT trackAttr
     FOR i = 0 TO visibleCount - 1
         rowY = 2 + i
 
         IF (g_PlaylistScrollOffset + i) < g_FilteredCount THEN
             realIdx = g_FilteredIndices[g_PlaylistScrollOffset + i]
-            numPrefix = RIGHT$("     " + LTRIM$(STR$(realIdx + 1)), 5) + CHR$(179) + " "
 
-            IF realIdx = argIdx THEN playingTag = " [PLAYING]" ELSE playingTag = ""
+            IF g_RowKind = 1 OR g_RowKind = 2 OR g_RowKind = 4 THEN
+                numPrefix = RIGHT$("     " + LTRIM$(STR$(g_PlaylistScrollOffset + i + 1)), 5) + CHR$(179) + " "
+                isPlayingRow = 0
+                IF g_RowKind = 4 THEN
+                    IF realIdx / 10000000 = 3 THEN
+                        IF realIdx % 10000000 = argIdx THEN isPlayingRow = 1
+                    ENDIF
+                ENDIF
+            ELSE
+                numPrefix = RIGHT$("     " + LTRIM$(STR$(realIdx + 1)), 5) + CHR$(179) + " "
+                IF realIdx = argIdx THEN isPlayingRow = 1 ELSE isPlayingRow = 0
+            ENDIF
+            IF isPlayingRow = 1 THEN playingTag = " [PLAYING]" ELSE playingTag = ""
 
             isPlSelected = ((g_PlaylistScrollOffset + i) = g_PlaylistSelectIdx)
 
@@ -2390,23 +2545,21 @@ LTRIM$(STR$(currentPage)) + "/" + LTRIM$(STR$(totalPages)) + timeInfo + ") ]"
                 GetMarqueeSlice(&g_PlMarqueeRing, g_PlMarqueePeriod, plMarqueeOffset, 57, &g_PlMarqueeDisp)
                 dispName = g_PlMarqueeDisp
             ELSE
-                trackName = ConvertANSItoOEM(EnsureANSI(GetFileNameOnly(g_Playlist[realIdx])))
-                dispName  = LEFT$(trackName + SPACE$(57), 57)
+                dispName = LEFT$(BrItemText(g_PlaylistScrollOffset + i) + SPACE$(57), 57)
             ENDIF
 
             trackLine = " " + numPrefix + dispName + playingTag
             trackLine = LEFT$(trackLine + SPACE$(77), 77)
 
-            ' Dynamic Theme Coloring Logic
             IF isPlSelected = 1 THEN
-                IF realIdx = argIdx THEN
+                IF isPlayingRow = 1 THEN
                     trackAttr = C_BLACK + (colStatusPlay * 16)
                 ELSE
                     trackAttr = C_BLACK + (colArtist * 16)
                 ENDIF
                 trackLine = ">" + RIGHT$(trackLine, 76)
             ELSE
-                IF realIdx = argIdx THEN
+                IF isPlayingRow = 1 THEN
                     trackAttr = colStatusPlay + (C_BLACK * 16)
                 ELSE
                     trackAttr = colVu + (C_BLACK * 16)
@@ -2418,7 +2571,6 @@ LTRIM$(STR$(currentPage)) + "/" + LTRIM$(STR$(totalPages)) + timeInfo + ") ]"
             BufWriteEx(&g_PlaylistBuf[0], 0, rowY, SPACE$(77), C_BLACK + (C_BLACK * 16))
         ENDIF
 
-        ' --- 4. Render Scroll Bar Track on Right Margin (Column 78) ---
         IF g_FilteredCount > visibleCount THEN
             INT maxScroll = g_FilteredCount - visibleCount
             IF maxScroll < 1 THEN maxScroll = 1
@@ -2434,10 +2586,9 @@ LTRIM$(STR$(currentPage)) + "/" + LTRIM$(STR$(totalPages)) + timeInfo + ") ]"
         ENDIF
     NEXT i
 
-    ' Row 21: Separator
     BufWriteEx(&g_PlaylistBuf[0], 0, 21, STRING$(80, 250), colStatic + (C_BLACK * 16))
 
-    ' --- 5. Search Filter Bar (Row 22) ---
+    ' --- Search bar (row 22) ---
     STRING searchStr
     INT searchAttr
     IF g_SearchActive = 1 THEN
@@ -2447,39 +2598,49 @@ LTRIM$(STR$(currentPage)) + "/" + LTRIM$(STR$(totalPages)) + timeInfo + ") ]"
         searchAttr = colStatic + (C_BLACK * 16)
         IF g_SearchBuf <> "" THEN
             searchStr = LEFT$(" Filter Active: \"" + g_SearchBuf + "\" (Press [S] to Edit, [Esc] to Clear)" + SPACE$(80), 80)
+        ELSEIF g_BrMode <> 0 THEN
+            searchStr = LEFT$(" Press [S] to search artist / album / title (3+ letters)..." + SPACE$(80), 80)
         ELSE
             searchStr = LEFT$(" Press [S] to Search / Filter Playlist..." + SPACE$(80), 80)
         ENDIF
     ENDIF
     BufWriteEx(&g_PlaylistBuf[0], 0, 22, searchStr, searchAttr)
 
-    ' Row 23: Blank Separator
     BufWriteEx(&g_PlaylistBuf[0], 0, 23, SPACE$(80), C_BLACK + (C_BLACK * 16))
 
-    ' --- 6. Footer Hotkey Bar (Row 24) ---
+    ' --- Footer (row 24) ---
     STRING footerStr
     IF g_SearchActive = 1 THEN
-        footerStr = LEFT$(" [Enter] Play Selected " + CHR$(179) + " [Backspace] Delete " + CHR$(179) + " [Esc] Cancel Search" + _
+        footerStr = LEFT$(" [Enter] Open/Play " + CHR$(179) + " [Backspace] Delete " + CHR$(179) + " [Esc] Cancel Search" + _
 SPACE$(80), 80)
+    ELSEIF g_BrMode <> 0 THEN
+        footerStr = LEFT$(" [Tab] Files " + CHR$(179) + " [Enter] Open/Play " + CHR$(179) + " [P]lay " + CHR$(179) + _
+" [S]earch " + CHR$(179) + " [Esc] Up/Back" + SPACE$(80), 80)
     ELSE
-        footerStr = LEFT$(" [S]earch " + CHR$(179) + " [Enter] Play & Resume Queue " + CHR$(179) + " [P]lay All Filtered " + _
-CHR$(179) + " [Esc] Back" + SPACE$(80), 80)
+        footerStr = LEFT$(" [S]earch " + CHR$(179) + " [Enter] Play " + CHR$(179) + " [P]lay All " + CHR$(179) + _
+" [Tab] Library " + CHR$(179) + " [Esc] Back" + SPACE$(80), 80)
     ENDIF
     BufWriteEx(&g_PlaylistBuf[0], 0, 24, footerStr, colVu + (colStatic * 16))
 
-    ' --- 7. Bottom Telemetry Bar (Rows 25 & 26) ---
-    STRING sysSummary = " TRACKS: " + LTRIM$(STR$(g_FilteredCount)) + " / " + LTRIM$(STR$(g_TrackCount))
+    ' --- Telemetry (rows 25, 26) ---
+    STRING sysSummary
+    IF g_BrMode <> 0 THEN
+        sysSummary = " LIBRARY: " + LTRIM$(STR$(g_LibIndexBuiltFor)) + " of " + LTRIM$(STR$(g_TrackCount)) + _
+" tracks indexed (Tab twice to refresh)"
+    ELSE
+        sysSummary = " TRACKS: " + LTRIM$(STR$(g_FilteredCount)) + " / " + LTRIM$(STR$(g_TrackCount))
+    ENDIF
     sysSummary = LEFT$(sysSummary + SPACE$(80), 80)
 
     BufWriteEx(&g_PlaylistBuf[0], 0, 25, STRING$(80, 196), colStatic + (C_BLACK * 16))
     BufWriteEx(&g_PlaylistBuf[0], 0, 26, sysSummary, colStatic + (C_BLACK * 16))
 
-    ' --- 8. Single Atomic Flush of Entire Framebuffer ---
     FlushBufferEx(hPlaylistBuffer, &g_PlaylistBuf[0], 0, 26)
 ENDSUB
 
 SUB DrawStaticHUDBuf()
-    BufWrite(0, 0, " [SPACE] Pause " + CHR$(179) + " [P]rev " + CHR$(179) + " [N]ext " + CHR$(179) + " [S]huffle " + CHR$(179) + " [Up/Dn] Vol " + CHR$(179) + " [Lft/Rgt] Seek" + SPACE$(5), colVu + (colStatic * 16))
+    BufWrite(0, 0, " [SPACE] Pause " + CHR$(179) + " [P]rev " + CHR$(179) + " [N]ext " + CHR$(179) + " [S]huffle " + CHR$(179) + _
+" [Up/Dn] Vol " + CHR$(179) + " [Lft/Rgt] Seek" + SPACE$(5), colVu + (colStatic * 16))
     BufWrite(0, 1, STRING$(80, 196), ColStatic)
     BufWrite(1, 2, " ARTIST   :", colStatic)
     BufWrite(1, 3, " TITLE    :", colStatic)
@@ -2493,14 +2654,20 @@ SUB DrawStaticHUDBuf()
     BufWrite(1, 10, " BITRATE  :", colStatic)
     BufWrite(1, 11, " SIZE     :", colStatic)
     BufWrite(0, 12, STRING$(80, 250), ColStatic)
-    BufWrite(0, 24, " [B]rowse playlist " + CHR$(179) + " [ [T]hemes " + CHR$(179) + " [C]omments " + CHR$(179) + " [L]yrics " + CHR$(179) + " [O]ptions " + CHR$(179) + " [Q]uit" + SPACE$(4), colVu + (colStatic * 16))
+BufWrite(0, 24, " [B]rowse " + CHR$(179) + " [T]hemes " + CHR$(179) + " [C]omments " + CHR$(179) + " [L]yrics " + CHR$(179) + _
+" [O]ptions " + CHR$(179) + " [Q]uit " + CHR$(179) + " [F1] Help" + SPACE$(3), colVu + (colStatic * 16))
     DrawBottomTelemetryBuf()
 ENDSUB
 
 SUB DrawBottomTelemetryBuf()
     ' Build Active DSP summary (All 7 Modules)
     STRING dspSummary = " DSP " + CHR$(175)
-    IF g_EqEnabled = 1 THEN dspSummary = dspSummary + " EQ : " + LEFT$(g_EqProfile, 6) + " " ELSE dspSummary = dspSummary + " EQ : OFF "
+    IF g_EqEnabled = 1 THEN dspSummary = dspSummary + " EQ : " + LEFT$(g_EqProfile, 6) + " " ELSE dspSummary = dspSummary + _
+" EQ : OFF "
+    IF g_RGMode > 0 THEN
+        IF g_RGMode = 1 THEN dspSummary = dspSummary + CHR$(254) + " RG:TRK " ELSE dspSummary = dspSummary + CHR$(254) + " RG:ALB "
+        IF RGIsActive() = 1 THEN dspSummary = dspSummary + FormatDb(GetReplayGainDb()) + " " ELSE dspSummary = dspSummary + "none "
+    ENDIF
     IF g_NormEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " NORM "
     IF g_CompEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " COMP "
     IF g_ReverbEnabled = 1 THEN dspSummary = dspSummary + CHR$(254) + " REV "
@@ -2589,6 +2756,7 @@ SUB RedrawCurrentScreen()
         CASE 1 : DrawOptionsScreen()
         CASE 2 : DrawMoreOptionsScreen()
         CASE 3 : DrawPlaylistScreen()
+        CASE 4 : DrawHelpScreen()
     ENDSELECT
 ENDSUB
 
@@ -2996,25 +3164,28 @@ SUB ParseLRC(POINTER pContent)
     g_IsSyncedLyrics = 0
     IF #<BYTE>pContent[0] = 0 THEN RETURN
 
-    INT cPos = 0, lineLen = 0, b
+    INT cPos = 0, lineLen = 0, b, atEnd = 0
     ISTRING lineBuf[128]
     DOUBLE mins, secs, ts
     INT bracketEnd, colonPos
 
-    WHILE #<BYTE>pContent[cPos] <> 0 AND g_SyncedCount < 300
+    WHILE atEnd = 0 AND g_SyncedCount < 300
         b = #<BYTE>pContent[cPos] & 255
+        IF b = 0 THEN atEnd = 1
+
         IF b = 13 THEN
             ' Ignore CR
-        ELSEIF b = 10 THEN
+        ELSEIF b = 10 OR b = 0 THEN
             lineBuf[lineLen] = 0
-            IF lineBuf[0] = 91 THEN
-                colonPos = INSTR(lineBuf, ":")
+            ' Timestamp lines only: "[" followed by a DIGIT
+            IF lineLen > 3 AND lineBuf[0] = 91 AND lineBuf[1] >= 48 AND lineBuf[1] <= 57 THEN
+                colonPos   = INSTR(lineBuf, ":")
                 bracketEnd = INSTR(lineBuf, "]")
                 IF colonPos > 1 AND bracketEnd > colonPos THEN
                     mins = VAL(MID$(lineBuf, 2, colonPos - 2))
                     secs = VAL(MID$(lineBuf, colonPos + 1, bracketEnd - colonPos - 1))
                     ts = mins * 60.0 + secs
-                    
+
                     g_SyncedLyrics[g_SyncedCount].timestamp = ts
                     g_SyncedLyrics[g_SyncedCount].text = LTRIM$(RTRIM$(RIGHT$(lineBuf, LEN(lineBuf) - bracketEnd)))
                     g_SyncedCount = g_SyncedCount + 1
@@ -3035,7 +3206,7 @@ ENDSUB
 SUB ParseM3U(STRING playlistPath)
     FILE hFile
     STRING lineBuffer, basePath = ""
-    INT i
+    INT i, firstLine = 1
 
     FOR i = LEN(playlistPath) TO 1 STEP -1
         IF MID$(playlistPath, i, 1) = "\\" OR MID$(playlistPath, i, 1) = "/" THEN
@@ -3045,8 +3216,14 @@ SUB ParseM3U(STRING playlistPath)
 
     IF OPENFILE(hFile, playlistPath, "R") = 0 THEN
         WHILE READ(hFile, lineBuffer) = 0
+            IF firstLine = 1 THEN
+                IF LEFT$(lineBuffer, 3) = CHR$(239) + CHR$(187) + CHR$(191) THEN lineBuffer = RIGHT$(lineBuffer, LEN(lineBuffer) - 3)
+                firstLine = 0
+            ENDIF
+
             lineBuffer = LTRIM$(RTRIM$(lineBuffer))
             IF LEN(lineBuffer) > 0 AND LEFT$(lineBuffer, 1) <> "#" THEN
+                lineBuffer = EnsureANSI(lineBuffer)
                 IF MID$(lineBuffer, 2, 1) = ":" OR LEFT$(lineBuffer, 1) = "\\" OR LEFT$(lineBuffer, 1) = "/" THEN
                     AddToQueue(lineBuffer)
                 ELSE
@@ -3058,7 +3235,41 @@ SUB ParseM3U(STRING playlistPath)
     ENDIF
 ENDSUB
 
+' Case-insensitive wildcard match ("*" = any run, "?" = any one char)
+SUB WildcardMatch(STRING pat, STRING txt), INT
+    STRING p = LCASE$(pat)
+    STRING t = LCASE$(txt)
+    INT pl = LEN(p), tl = LEN(t)
+    INT pIdx = 1, tIdx = 1, starIdx = 0, matchIdx = 0
+
+    WHILE tIdx <= tl
+        IF pIdx <= pl AND (MID$(p, pIdx, 1) = "?" OR MID$(p, pIdx, 1) = MID$(t, tIdx, 1)) THEN
+            pIdx = pIdx + 1
+            tIdx = tIdx + 1
+        ELSEIF pIdx <= pl AND MID$(p, pIdx, 1) = "*" THEN
+            starIdx  = pIdx
+            matchIdx = tIdx
+            pIdx = pIdx + 1
+        ELSEIF starIdx > 0 THEN
+            ' Backtrack: let the last "*" swallow one more character
+            pIdx = starIdx + 1
+            matchIdx = matchIdx + 1
+            tIdx = matchIdx
+        ELSE
+            RETURN 0
+        ENDIF
+    ENDWHILE
+
+    WHILE pIdx <= pl AND MID$(p, pIdx, 1) = "*"
+        pIdx = pIdx + 1
+    ENDWHILE
+
+    IF pIdx > pl THEN RETURN 1
+    RETURN 0
+ENDSUB
+
 SUB ProcessArgument(STRING param)
+
     STRING folderPath, ext, trackPath
     INT lastSlash = 0, idx, totalFiles, fileIdx, attr
 
@@ -3070,6 +3281,7 @@ SUB ProcessArgument(STRING param)
     IF LEN(param) = 0 THEN RETURN
 
     attr = GetFileAttributesA(param)
+
     IF attr <> -1 AND (attr & 0x10) <> 0 THEN
         folderPath = param
         WHILE RIGHT$(folderPath, 1) = "\\" OR RIGHT$(folderPath, 1) = "/"
@@ -3092,28 +3304,50 @@ SUB ProcessArgument(STRING param)
         RETURN
     ENDIF
 
-    IF INSTR(param, "*") > 0 OR INSTR(param, "?") > 0 THEN
+        IF INSTR(param, "*") > 0 OR INSTR(param, "?") > 0 THEN
+        STRING namePat, ext1, ext2
+        INT dotPos = 0, pass
+
         FOR idx = 1 TO LEN(param)
             IF MID$(param, idx, 1) = "\\" OR MID$(param, idx, 1) = "/" THEN lastSlash = idx
         NEXT idx
 
         IF lastSlash > 0 THEN
             folderPath = LEFT$(param, lastSlash - 1)
-            ext = RIGHT$(param, LEN(param) - lastSlash)
+            namePat    = RIGHT$(param, LEN(param) - lastSlash)
         ELSE
-            folderPath = "." : ext = param
+            folderPath = "."
+            namePat    = param
         ENDIF
 
-        WHILE LEFT$(ext, 1) = "*" OR LEFT$(ext, 1) = "."
-            ext = RIGHT$(ext, LEN(ext) - 1)
-        WEND
+        ' Extension = text after the last dot of the pattern (the folder scan is by extension)
+        FOR idx = 1 TO LEN(namePat)
+            IF MID$(namePat, idx, 1) = "." THEN dotPos = idx
+        NEXT idx
+        IF dotPos > 0 THEN
+            ext1 = LCASE$(RIGHT$(namePat, LEN(namePat) - dotPos))
+        ELSE
+            ext1 = LCASE$(namePat)
+        ENDIF
+        ext2 = ""
+
+        ' Wildcard (or no) extension, e.g. "Album*": scan both supported types
+        IF ext1 = "" OR INSTR(ext1, "*") > 0 OR INSTR(ext1, "?") > 0 THEN
+            ext1 = "mp3"
+            ext2 = "flac"
+        ENDIF
 
         DynaNew(g_fileList, 100, 50)
-        totalFiles = GetDynaFileList(g_fileList, folderPath, ext, 1)
-        FOR fileIdx = 0 TO totalFiles - 1
-            DynaGetStr(g_fileList, fileIdx, trackPath)
-            AddToQueue(trackPath)
-        NEXT fileIdx
+        FOR pass = 1 TO 2
+            IF pass = 1 THEN ext = ext1 ELSE ext = ext2
+            IF ext <> "" THEN
+                totalFiles = GetDynaFileList(g_fileList, folderPath, ext, 1)
+                FOR fileIdx = 0 TO totalFiles - 1
+                    DynaGetStr(g_fileList, fileIdx, trackPath)
+                    IF WildcardMatch(namePat, GetFileNameOnly(trackPath)) = 1 THEN AddToQueue(trackPath)
+                NEXT fileIdx
+            ENDIF
+        NEXT pass
         DynaDelete(g_fileList)
         RETURN
     ENDIF
@@ -3149,6 +3383,17 @@ SUB EnumerateAudioDevices()
         pDevName = BASS_GetDeviceDescription(devIdx)
     WEND
     ' Trace("EnumerateAudioDevices: Total enumerated = " + LTRIM$(STR$(g_AudioDeviceCount)))
+ENDSUB
+
+SUB InitSpectrumConfig()
+    DWORD ver = BASS_GetVersion()
+    INT minor = (ver >> 16) & 255          ' 0x0204xxxx = BASS 2.4
+    IF minor >= 4 THEN
+        g_SpecFftFlag = 0x80000003         ' 2.4: FFT256=..00 FFT512=..01 FFT1024=..02 FFT2048=..03
+    ELSE
+        g_SpecFftFlag = 0x80000002         ' 2.2/2.3: FFT512=..00 FFT1024=..01 FFT2048=..02
+    ENDIF
+    g_SpecFftBins = 1024
 ENDSUB
 
 SUB InitAudioEngine(), INT
@@ -3227,10 +3472,12 @@ SUB SwitchAudioOutputDevice(INT newDeviceListIdx)
         BASS_ChannelStop(hStream)
         BASS_StreamFree(hStream)
         hStream = 0
+        DiscardPreload()
     ENDIF
 
     ' 2. Safely free existing BASS context
     BASS_Free()
+    g_hOldFadingStream = 0
 
     ' 3. Restore custom buffer settings (wiped by BASS_Free)
     BASS_SetConfig(BASS_CONFIG_UPDATEPERIOD, 20)
@@ -3310,13 +3557,17 @@ SUB LoadConfig()
                     CASE "crossfeed_enabled"
                         IF valNum = 0 OR valNum = 1 THEN g_CrossfeedEnabled = valNum
                     CASE "balance"
-                        g_Balance = valNum
+                        IF valNum >= -100 AND valNum <= 100 THEN g_Balance = valNum
                     CASE "mono_downmix"
                         IF valNum = 0 OR valNum = 1 THEN g_MonoDownmix = valNum
                     CASE "gapless"
                         IF valNum = 0 OR valNum = 1 THEN g_Gapless = valNum
                     CASE "crossfade"
                         IF valNum >= 0 AND valNum <= 5 THEN g_Crossfade = valNum
+                    CASE "rg_mode"
+                        IF valNum >= 0 AND valNum <= 2 THEN g_RGMode = valNum
+                    CASE "rg_preamp"
+                        IF valNum >= -12 AND valNum <= 12 THEN g_RGPreampDb = valNum
                     CASE "resume_pos"
                         IF valNum = 0 OR valNum = 1 THEN g_ResumePos = valNum
                     CASE "last_track_idx"
@@ -3355,6 +3606,8 @@ SUB SaveConfig()
         WRITE hF, "mono_downmix=" + LTRIM$(STR$(g_MonoDownmix))
         WRITE hF, "gapless=" + LTRIM$(STR$(g_Gapless))
         WRITE hF, "crossfade=" + LTRIM$(STR$(g_Crossfade))
+        WRITE hF, "rg_mode=" + LTRIM$(STR$(g_RGMode))
+        WRITE hF, "rg_preamp=" + LTRIM$(STR$(g_RGPreampDb))
         WRITE hF, "resume_pos=" + LTRIM$(STR$(g_ResumePos))
         WRITE hF, "last_track_idx=" + LTRIM$(STR$(g_LastTrackIdx))
         WRITE hF, "last_track_pos=" + LTRIM$(STR$(g_LastTrackPos))
@@ -3364,49 +3617,60 @@ SUB SaveConfig()
 ENDSUB
 
 SUB SavePlaylistM3U()
-    FILE hF
-    STRING m3uPath = GETSTARTPATH() + "cplay.m3u"
-    INT i
-
+    INT i, total = 0
     IF g_TrackCount <= 0 THEN RETURN
-
-    IF OPENFILE(hF, m3uPath, "W") = 0 THEN
-        FOR i = 0 TO g_TrackCount - 1
-            IF LEN(g_Playlist[i]) > 0 THEN
-                WRITE hF, g_Playlist[i]
-            ENDIF
-        NEXT i
-        CLOSEFILE(hF)
-    ENDIF
+    FOR i = 0 TO g_TrackCount - 1
+        total = total + LEN(g_Playlist[i]) + 2
+    NEXT i
+    OutBegin(total)
+    FOR i = 0 TO g_TrackCount - 1
+        IF LEN(g_Playlist[i]) > 0 THEN OutLine(g_Playlist[i])
+    NEXT i
+    OutFlushToFile(GETSTARTPATH() + "cplay.m3u")
 ENDSUB
 
 ' ----------------------------------------------------------------------------
 ' Native Memory Tag Extractors
 ' ----------------------------------------------------------------------------
 SUB GetVorbisComment(DWORD hStream, STRING targetField), STRING
-    POINTER pTags = BASS_ChannelGetTags(hStream, 2) 
+    POINTER pTags = BASS_ChannelGetTags(hStream, 2)
     IF pTags = 0 THEN RETURN ""
 
-    STRING currentStr = "", fieldPrefix = targetField + "=", result = ""
-    INT i = 0, pLen = LEN(fieldPrefix), charVal
+    STRING fieldPrefix = UCASE$(targetField) + "=", result = ""
+    INT pLen = LEN(fieldPrefix), i = 0, k, b, c, match, n
 
-    WHILE 1
-        charVal = #<BYTE>pTags[i] & 255
-        IF charVal = 0 THEN
-            IF currentStr = "" THEN BREAK 
-            IF UCASE$(LEFT$(currentStr, pLen)) = fieldPrefix THEN
-                result = RIGHT$(currentStr, LEN(currentStr) - pLen)
+    WHILE (#<BYTE>pTags[i] & 255) <> 0
+        match = 1
+        FOR k = 0 TO pLen - 1
+            b = #<BYTE>pTags[i + k] & 255
+            IF b >= 97 AND b <= 122 THEN b = b - 32
+            c = ASC(MID$(fieldPrefix, k + 1, 1))
+            IF b <> c THEN
+                match = 0
                 BREAK
             ENDIF
-            currentStr = ""
-        ELSE
-            currentStr = currentStr + CHR$(charVal)
+        NEXT k
+
+        IF match = 1 THEN
+            i = i + pLen
+            n = 0
+            WHILE (#<BYTE>pTags[i] & 255) <> 0 AND n < 250
+                result = result + CHR$(#<BYTE>pTags[i] & 255)
+                i = i + 1
+                n = n + 1
+            ENDWHILE
+            RETURN LTRIM$(RTRIM$(result))
         ENDIF
+
+        WHILE (#<BYTE>pTags[i] & 255) <> 0
+            i = i + 1
+        ENDWHILE
         i = i + 1
     ENDWHILE
-    RETURN LTRIM$(RTRIM$(result))
+    RETURN ""
 ENDSUB
 
+' ID3v2.4 syncsafe frame sizes, correct end-of-tag bound (tagSize + 10)
 SUB GetRawID3v2(DWORD hStream, STRING targetID), STRING
     POINTER pID3 = BASS_ChannelGetTags(hStream, BASS_TAG_ID3V2)
     IF pID3 = 0 THEN RETURN ""
@@ -3415,16 +3679,21 @@ SUB GetRawID3v2(DWORD hStream, STRING targetID), STRING
     INT b1 = #<BYTE>pID3[6] & 0x7F, b2 = #<BYTE>pID3[7] & 0x7F
     INT b3 = #<BYTE>pID3[8] & 0x7F, b4 = #<BYTE>pID3[9] & 0x7F
     INT tagSize = (b1 << 21) | (b2 << 14) | (b3 << 7) | b4
+    INT tagEnd  = tagSize + 10          ' header (10 bytes) + payload
     INT pos = 10, fSize, headSize, k, charVal
     STRING frameID, result, matchID
 
-    WHILE pos < tagSize - 10
+    WHILE pos < tagEnd - 10
         charVal = #<BYTE>pID3[pos] & 255
-        IF charVal = 0 THEN BREAK 
+        IF charVal = 0 THEN BREAK
 
         IF version >= 3 THEN
             frameID = CHR$(charVal) + CHR$(#<BYTE>pID3[pos+1] & 255) + CHR$(#<BYTE>pID3[pos+2] & 255) + CHR$(#<BYTE>pID3[pos+3] & 255)
-            fSize = ((#<BYTE>pID3[pos+4] & 255) << 24) | ((#<BYTE>pID3[pos+5] & 255) << 16) | ((#<BYTE>pID3[pos+6] & 255) << 8) | (#<BYTE>pID3[pos+7] & 255)
+            IF version = 4 THEN
+                fSize = ((#<BYTE>pID3[pos+4] & 0x7F) << 21) | ((#<BYTE>pID3[pos+5] & 0x7F) << 14) | ((#<BYTE>pID3[pos+6] & 0x7F) << 7) | (#<BYTE>pID3[pos+7] & 0x7F)
+            ELSE
+                fSize = ((#<BYTE>pID3[pos+4] & 255) << 24) | ((#<BYTE>pID3[pos+5] & 255) << 16) | ((#<BYTE>pID3[pos+6] & 255) << 8) | (#<BYTE>pID3[pos+7] & 255)
+            ENDIF
             headSize = 10
         ELSE
             frameID = CHR$(charVal) + CHR$(#<BYTE>pID3[pos+1] & 255) + CHR$(#<BYTE>pID3[pos+2] & 255)
@@ -3432,7 +3701,7 @@ SUB GetRawID3v2(DWORD hStream, STRING targetID), STRING
             headSize = 6
         ENDIF
 
-        IF fSize <= 0 OR (pos + headSize + fSize) > tagSize THEN BREAK
+        IF fSize <= 0 OR (pos + headSize + fSize) > tagEnd THEN BREAK
 
         matchID = targetID
         IF version = 2 AND LEN(targetID) = 4 THEN
@@ -3520,7 +3789,9 @@ SUB GetVorbisCommentLongPtr(DWORD hStream, STRING targetField, POINTER pDest, IN
         IF b = 0 THEN BREAK
         match = 1
         FOR k = 0 TO pLen - 1
-            IF (#<BYTE>pTags[i + k] & 255) <> ASC(MID$(fieldPrefix, k + 1, 1)) THEN
+            b = #<BYTE>pTags[i + k] & 255
+            IF b >= 97 AND b <= 122 THEN b = b - 32
+            IF b <> ASC(UCASE$(MID$(fieldPrefix, k + 1, 1))) THEN
                 match = 0 : BREAK
             ENDIF
         NEXT k
@@ -3549,7 +3820,7 @@ SUB GetID3v2LongTextPtr(DWORD hStream, STRING targetID, POINTER pDest, INT maxLe
     INT pos = 10, fSize, headSize, k, enc, descEnd, textStart, charVal, outIdx
     STRING frameID, matchID
     
-    WHILE pos < tagSize - 10
+    WHILE pos < (tagSize + 10) - 10
         charVal = #<BYTE>pID3[pos] & 255
         IF charVal = 0 THEN BREAK
 
@@ -3567,7 +3838,7 @@ SUB GetID3v2LongTextPtr(DWORD hStream, STRING targetID, POINTER pDest, INT maxLe
             headSize = 6
         ENDIF
 
-        IF fSize <= 0 OR (pos + headSize + fSize) > tagSize THEN BREAK
+        IF fSize <= 0 OR (pos + headSize + fSize) > (tagSize + 10) THEN BREAK
 
         matchID = targetID
         IF version = 2 AND LEN(targetID) = 4 THEN
@@ -3614,6 +3885,9 @@ ENDSUB
 
 SUB LoadTrackMetadata(DWORD hStream, INT argIdx)
     IF hStream = 0 THEN RETURN
+
+    ' 0. Get Replay Gain values if any
+    ReadReplayGain(hStream)
 
     ' 1. Pre-load GDI cover art cache
     LoadCoverArtCache(hStream, g_Playlist[argIdx])
@@ -3685,6 +3959,7 @@ SUB LoadTrackMetadata(DWORD hStream, INT argIdx)
     ENDIF
 
     ParseLRC(g_pLyrics)
+
     IF g_IsSyncedLyrics = 0 AND g_pLyrics[0] <> 0 THEN
         WrapText_InPlace(g_pLyrics, 60, 8192)
     ENDIF
@@ -3853,8 +4128,7 @@ ENDSUB
 
 SUB InitPlMarqueeRing()
     IF g_FilteredCount > 0 AND g_PlaylistSelectIdx >= 0 AND g_PlaylistSelectIdx < g_FilteredCount THEN
-        INT realIdx = g_FilteredIndices[g_PlaylistSelectIdx]
-        STRING trackName = ConvertANSItoOEM(EnsureANSI(GetFileNameOnly(g_Playlist[realIdx])))
+        STRING trackName = BrItemText(g_PlaylistSelectIdx)
         IF LEN(trackName) > 57 THEN
             STRING padName    = trackName + " || "
             g_PlMarqueeRing   = padName + padName
@@ -3873,23 +4147,25 @@ SUB FilterPlaylist()
     INT i
     g_FilteredCount = 0
     STRING cleanQuery = LTRIM$(RTRIM$(g_SearchBuf))
-    
+
     plMarqueeOffset = 0
     plMarqueeTick   = 0
 
-    ' Fast path: If search query is empty or less than 3 chars, skip array scanning
-    IF cleanQuery = "" OR LEN(cleanQuery) < 3 THEN
+    IF g_BrMode <> 0 THEN
+        BrFillLibrary(cleanQuery)
+    ELSEIF cleanQuery = "" OR LEN(cleanQuery) < 3 THEN
+        g_RowKind = 0
+        g_BrSearchRes = 0
         FOR i = 0 TO g_TrackCount - 1
             g_FilteredIndices[i] = i
         NEXT i
         g_FilteredCount = g_TrackCount
     ELSE
+        g_RowKind = 0
+        g_BrSearchRes = 0
         STRING fileNameOnly
         FOR i = 0 TO g_TrackCount - 1
-            ' Extract filename only to prevent drive letter/path false positives
             fileNameOnly = GetFileNameOnly(g_Playlist[i])
-            
-            ' Fast case-insensitive match via direct pointers
             IF xinstr(&fileNameOnly, &cleanQuery, 1) > 0 THEN
                 g_FilteredIndices[g_FilteredCount] = i
                 g_FilteredCount = g_FilteredCount + 1
@@ -3897,7 +4173,6 @@ SUB FilterPlaylist()
         NEXT i
     ENDIF
 
-    ' Reset selection bounds safety
     IF g_PlaylistSelectIdx >= g_FilteredCount THEN
         g_PlaylistSelectIdx = g_FilteredCount - 1
     ENDIF
@@ -3966,9 +4241,9 @@ SUB LoadCoverArtCache(DWORD hStream, STRING trackPath)
             INT i, imgSize = 0
             STRING tmpImg = ""
             
-            FOR i = 10 TO tagSize - 4
+            FOR i = 10 TO (tagSize + 10) - 4
                 IF *<BYTE>(pID3 + i) = 0xFF AND *<BYTE>(pID3 + i + 1) = 0xD8 AND *<BYTE>(pID3 + i + 2) = 0xFF THEN
-                    imgSize = tagSize - i : tmpImg = GETSTARTPATH() + "cplay_tmp.jpg"
+                    imgSize = (tagSize + 10) - i : tmpImg = GETSTARTPATH() + "cplay_tmp.jpg"
                 ELSEIF *<BYTE>(pID3 + i) = 0x89 AND *<BYTE>(pID3 + i + 1) = 0x50 AND *<BYTE>(pID3 + i + 2) = 0x4E AND *<BYTE>(pID3 + i + 3) = 0x47 THEN
                     imgSize = tagSize - i : tmpImg = GETSTARTPATH() + "cplay_tmp.png"
                 ENDIF
@@ -3981,7 +4256,7 @@ SUB LoadCoverArtCache(DWORD hStream, STRING trackPath)
                         CloseHandle(hFile)
                         imgPath = tmpImg
                     ENDIF
-                    i = tagSize
+                    i = tagSize + 10
                 ENDIF
             NEXT i
         ENDIF
@@ -4309,10 +4584,1344 @@ SUB RefreshExtendedDisplayBuf(POINTER pCom, POINTER pLyr, DOUBLE currentSecs, IN
         CASE 3
             DrawExtendedMetadataHUDBuf()
 
+        CASE 4
+            DrawSpectrumBuf()
+
         DEFAULT
             g_ExtDisplay = 3
             DrawExtendedMetadataHUDBuf()
     ENDSELECT
+ENDSUB
+
+SUB HelpLine(INT x, INT y, STRING keyTxt, STRING descTxt)
+    BufWriteEx(&g_HelpBuf[0], x, y, keyTxt, C_CYAN + (C_BLACK * 16))
+    BufWriteEx(&g_HelpBuf[0], x + 11, y, descTxt, C_LIGHT_GRAY + (C_BLACK * 16))
+ENDSUB
+
+SUB DrawHelpScreen()
+    INT i
+    FOR i = 0 TO 2159
+        g_HelpBuf[i].BufChar = 32
+        g_HelpBuf[i].Attributes = C_BLACK + (C_BLACK * 16)
+    NEXT i
+
+    STRING headerStr = STRING$(2, 196) + "[ KEYBOARD REFERENCE ]"
+    headerStr = LEFT$(headerStr + STRING$(80, 196), 80)
+    BufWriteEx(&g_HelpBuf[0], 0, 0, headerStr, colVu + (colStatic * 16))
+    BufWriteEx(&g_HelpBuf[0], 0, 1, STRING$(80, 196), colStatic + (C_BLACK * 16))
+
+    ' ---- Left column: player view ----
+    BufWriteEx(&g_HelpBuf[0], 2, 3, "[ PLAYER ]", C_YELLOW + (C_BLACK * 16))
+    HelpLine(2, 4,  "Space",      "Pause / resume")
+    HelpLine(2, 5,  "N / P",      "Next / previous track")
+    HelpLine(2, 6,  "Left/Right", "Seek 5s, Shift 30s, Ctrl 60s")
+    HelpLine(2, 7,  "Up/Down",    "Volume +/- 5")
+    HelpLine(2, 8,  "0 - 9",      "Jump to 0% ... 90% of track")
+    HelpLine(2, 9,  "Home",       "Restart track")
+    HelpLine(2, 10, "S",          "Shuffle on / off")
+    HelpLine(2, 11, "G",          "ReplayGain: off/track/album")
+    HelpLine(2, 12, "C / L",      "Comments / lyrics panel")
+    HelpLine(2, 13, "V",          "Spectrum analyzer panel")
+    HelpLine(2, 14, "T",          "Next colour theme")
+    HelpLine(2, 15, "B",          "Browse playlist")
+    HelpLine(2, 16, "Y",          "Music library")
+    HelpLine(2, 17, "O",          "Options (EQ / DSP)")
+    HelpLine(2, 18, "F1 or ?",    "This help")
+    HelpLine(2, 19, "Q",          "Quit")
+
+    BufWriteEx(&g_HelpBuf[0], 2, 21, "[ NOTES ]", C_YELLOW + (C_BLACK * 16))
+    BufWriteEx(&g_HelpBuf[0], 2, 22, "NORM only acts on tracks without a", C_LIGHT_GRAY + (C_BLACK * 16))
+    BufWriteEx(&g_HelpBuf[0], 2, 23, "ReplayGain tag while G is ON.", C_LIGHT_GRAY + (C_BLACK * 16))
+
+    ' ---- Right column ----
+    BufWriteEx(&g_HelpBuf[0], 44, 3, "[ PLAYLIST BROWSER ]", C_YELLOW + (C_BLACK * 16))
+    HelpLine(44, 4, "S",     "Search file names")
+    HelpLine(44, 5, "Enter", "Play, keep queue")
+    HelpLine(44, 6, "P",     "Play all filtered")
+    HelpLine(44, 7, "Tab",   "Switch to library")
+    HelpLine(44, 8, "Esc",   "Back / clear filter")
+
+    BufWriteEx(&g_HelpBuf[0], 44, 10, "[ LIBRARY ]", C_YELLOW + (C_BLACK * 16))
+    HelpLine(44, 11, "Tab",   "Back to file list")
+    HelpLine(44, 12, "Enter", "Open / play track")
+    HelpLine(44, 13, "P",     "Play artist/album/list")
+    HelpLine(44, 14, "S",     "Search (3+ letters)")
+    HelpLine(44, 15, "Esc",   "Clear, go up, leave")
+
+    BufWriteEx(&g_HelpBuf[0], 44, 17, "[ OPTIONS ]", C_YELLOW + (C_BLACK * 16))
+    HelpLine(44, 18, "Tab",   "Next panel")
+    HelpLine(44, 19, "Space", "Toggle selected DSP")
+    HelpLine(44, 20, "M",     "Engine options")
+    HelpLine(44, 21, "S",     "Save EQ preset")
+    HelpLine(44, 22, "Esc",   "Back")
+
+    BufWriteEx(&g_HelpBuf[0], 0, 24, LEFT$(" [Esc] / [F1] / [?] / [Enter] Close help" + SPACE$(80), 80), colVu + (colStatic * 16))
+    BufWriteEx(&g_HelpBuf[0], 0, 25, STRING$(80, 196), colStatic + (C_BLACK * 16))
+    BufWriteEx(&g_HelpBuf[0], 0, 26, LEFT$(" CPLAY " + CHR$(250) + " playback continues while this screen is open" + SPACE$(80), 80), colStatic + (C_BLACK * 16))
+
+    FlushBufferEx(hHelpBuffer, &g_HelpBuf[0], 0, 26)
+ENDSUB
+
+SUB SwitchToHelpView()
+    IF hHelpBuffer <> 0 AND hHelpBuffer <> -1 THEN
+        g_InOptionsView = 4
+        g_hConsole = hHelpBuffer
+        SetStdHandle(-11, hHelpBuffer)
+        SetConsoleActiveScreenBuffer(hHelpBuffer)
+        DrawHelpScreen()
+        ' Drain (NOT wait): empties characters left by the key that opened the help,
+        ' so they cannot close it again on the next frame.
+        WHILE INKEY$ <> "" : WEND
+    ENDIF
+ENDSUB
+
+SUB GetSeekStepSecs(), DOUBLE
+    IF (GetAsyncKeyState(0x11) & 0x8000) <> 0 THEN RETURN 60.0     ' Ctrl
+    IF (GetAsyncKeyState(0x10) & 0x8000) <> 0 THEN RETURN 30.0     ' Shift
+    RETURN 5.0
+ENDSUB
+
+' tenths = 0..9  ->  0% .. 90% of the current track (sample-aligned)
+SUB SeekToTenths(INT tenths)
+    IF hStream = 0 OR tenths < 0 OR tenths > 9 THEN RETURN
+    IF totalLenBytes <= 0q OR g_chanInfo.chans <= 0 THEN RETURN
+
+    DOUBLE frameB = g_chanInfo.chans * 2.0
+    DOUBLE dTot   = totalLenBytes
+    INT    frames = INT((dTot / frameB) * tenths / 10.0)
+    newPosBytes   = frames * frameB
+    BASS_ChannelSetPosition(hStream, newPosBytes)
+ENDSUB
+
+' Home = restart, 0-9 = jump. Polled with GetAsyncKeyState on the VIRTUAL-KEY codes, so it also
+' works on an AZERTY keyboard where the unshifted top row types & e " ( - e _ c a (INKEY$ would
+' not see digits there). Numpad digits (0x60..0x69) work too.
+SUB PollSeekKeys()
+    INT dk
+    IF (GetAsyncKeyState(0x24) & 0x8000) <> 0 THEN
+        IF homeDown = 0 THEN
+            homeDown = 1
+            BASS_ChannelSetPosition(hStream, 0q)
+        ENDIF
+    ELSE
+        homeDown = 0
+    ENDIF
+
+    FOR dk = 0 TO 9
+        IF (GetAsyncKeyState(0x30 + dk) & 0x8000) <> 0 OR (GetAsyncKeyState(0x60 + dk) & 0x8000) <> 0 THEN
+            IF g_DigitDown[dk] = 0 THEN
+                g_DigitDown[dk] = 1
+                SeekToTenths(dk)
+            ENDIF
+        ELSE
+            g_DigitDown[dk] = 0
+        ENDIF
+    NEXT dk
+ENDSUB
+
+SUB ClearExtRegion()
+    INT r, x, cell
+    FOR r = 13 TO 23
+        FOR x = 19 TO 79
+            cell = (r * 80) + x
+            g_FrameBuf[cell].BufChar = 32
+            g_FrameBuf[cell].Attributes = C_BLACK
+        NEXT x
+    NEXT r
+ENDSUB
+
+' Draws the 20 bars from g_SpecLvl[] into rows 13..23 / cols 19..78 of g_FrameBuf (no console I/O)
+SUB DrawSpectrumBuf()
+    INT b, r, x0, lvl, ch, at, y, cell
+
+    FOR b = 0 TO SPEC_BARS - 1
+        lvl = INT(g_SpecLvl[b])
+        x0  = 20 + (b * 3)
+
+        FOR r = 0 TO 9                 ' r = 0 is the bottom row (screen row 22)
+            ch = 0
+            IF lvl >= (2 * r) + 2 THEN
+                ch = 219
+            ELSEIF lvl = (2 * r) + 1 THEN
+                ch = 220
+            ENDIF
+
+            IF r >= 8 THEN
+                at = C_RED
+            ELSEIF r >= 6 THEN
+                at = C_YELLOW
+            ELSE
+                at = C_GREEN
+            ENDIF
+
+            IF ch = 0 THEN
+                ch = 32
+                at = C_BLACK
+            ENDIF
+
+            y = 22 - r
+            cell = (y * 80) + x0
+            g_FrameBuf[cell].BufChar = ch
+            g_FrameBuf[cell].Attributes = at
+            g_FrameBuf[cell + 1].BufChar = ch
+            g_FrameBuf[cell + 1].Attributes = at
+            g_FrameBuf[cell + 2].BufChar = 32
+            g_FrameBuf[cell + 2].Attributes = C_BLACK
+        NEXT r
+    NEXT b
+
+    ' Frequency labels = LOWER edge of the bar under them (40 Hz .. 16 kHz, log spaced)
+    BufWrite(19, 23, SPACE$(60), colStatic)
+    BufWrite(20, 23, "40",   colStatic)
+    BufWrite(32, 23, "130",  colStatic)
+    BufWrite(44, 23, "440",  colStatic)
+    BufWrite(56, 23, "1.4k", colStatic)
+    BufWrite(68, 23, "4.8k", colStatic)
+    BufWrite(77, 23, "12k",  colStatic)
+ENDSUB
+
+' Samples the FFT (max 25 updates/s), smooths the bars, redraws and flushes the panel.
+SUB UpdateSpectrum(DWORD hStreamHandle, INT isPlaying)
+    DWORD nowTick = GetTickCount()
+    IF nowTick - g_SpecLastTick < 40 THEN RETURN
+    g_SpecLastTick = nowTick
+
+    INT b, k, lo, hi, got = 0
+    DOUBLE hzPerBin, fLo, fHi, ratio, mag, target
+
+    IF isPlaying = 1 AND hStreamHandle <> 0 AND g_chanInfo.freq > 0 THEN
+        DWORD r = BASS_ChannelGetData(hStreamHandle, &g_FFTData[0], g_SpecFftFlag)
+        IF r <> -1 THEN got = 1
+    ENDIF
+
+    hzPerBin = (g_chanInfo.freq / 2.0) / g_SpecFftBins
+    IF hzPerBin <= 0.0 THEN hzPerBin = 1.0
+    ratio = (16000.0 / 40.0) ^ (1.0 / SPEC_BARS)
+    fLo = 40.0
+
+    FOR b = 0 TO SPEC_BARS - 1
+        fHi = fLo * ratio
+        mag = 0.0
+
+        IF got = 1 THEN
+            lo = INT(fLo / hzPerBin)
+            hi = INT(fHi / hzPerBin)
+            IF lo < 1 THEN lo = 1                      ' bin 0 is DC
+            IF hi > g_SpecFftBins - 1 THEN hi = g_SpecFftBins - 1
+            IF hi < lo THEN hi = lo
+            IF lo > hi THEN lo = hi
+            FOR k = lo TO hi
+                IF g_FFTData[k] > mag THEN mag = g_FFTData[k]
+            NEXT k
+        ENDIF
+        fLo = fHi
+
+        IF mag > 0.0 THEN
+            target = ((mag ^ 0.5) * (60.0 + (b * 5.0))) - 2.0         ' sqrt curve, 20 half-rows = full scale
+        ELSE
+            target = 0.0
+        ENDIF
+        IF target < 0.0 THEN target = 0.0
+        IF target > 20.0 THEN target = 20.0
+
+        IF target >= g_SpecLvl[b] THEN
+            g_SpecLvl[b] = target                       ' instant attack
+        ELSE
+            g_SpecLvl[b] = g_SpecLvl[b] - 1.0           ' fall: 1 half-row per update
+            IF g_SpecLvl[b] < target THEN g_SpecLvl[b] = target
+        ENDIF
+    NEXT b
+
+    DrawSpectrumBuf()
+    FlushExtendedRegion(g_hConsole)
+ENDSUB
+
+' ----------------------------------------------------------------------------
+'  Replay Gain Handlers
+' ----------------------------------------------------------------------------
+' Plain text -> number ("-6.48 dB", "+3.2", "0,5"); no dependence on how VAL handles decimals.
+SUB ParseDouble(STRING s), DOUBLE
+    INT i, c, neg = 0, seenDot = 0, started = 0
+    DOUBLE v = 0.0, scale = 1.0
+    g_ParseOK = 0
+
+    FOR i = 1 TO LEN(s)
+        c = ASC(MID$(s, i, 1))
+        IF c = 45 AND started = 0 THEN
+            neg = 1 : started = 1
+        ELSEIF c = 43 AND started = 0 THEN
+            started = 1
+        ELSEIF c = 46 OR c = 44 THEN
+            IF seenDot = 1 THEN BREAK
+            seenDot = 1 : started = 1
+        ELSEIF c >= 48 AND c <= 57 THEN
+            started = 1
+            g_ParseOK = 1
+            IF seenDot = 0 THEN
+                v = (v * 10.0) + (c - 48)
+            ELSE
+                scale = scale / 10.0
+                v = v + ((c - 48) * scale)
+            ENDIF
+        ELSEIF started = 1 THEN
+            BREAK                                 ' stops at the " dB" suffix
+        ENDIF
+    NEXT i
+
+    IF neg = 1 THEN v = -v
+    RETURN v
+ENDSUB
+
+' ID3v2 user text frame (TXXX) looked up by DESCRIPTION, e.g. "REPLAYGAIN_TRACK_GAIN".
+' Same frame walk as GetRawID3v2 (v2.3 / v2.4, plus v2.2 "TXX"). UTF-16 text is handled the same lossy
+' way GetRawID3v2 does it (keeps bytes 32..253), which is fine for the ASCII numbers we read.
+SUB GetID3v2TXXX(DWORD hStreamHandle, STRING desc), STRING
+    POINTER pID3 = BASS_ChannelGetTags(hStreamHandle, BASS_TAG_ID3V2)
+    IF pID3 = 0 THEN RETURN ""
+
+    INT version = #<BYTE>pID3[3]
+    INT b1 = #<BYTE>pID3[6] & 0x7F, b2 = #<BYTE>pID3[7] & 0x7F
+    INT b3 = #<BYTE>pID3[8] & 0x7F, b4 = #<BYTE>pID3[9] & 0x7F
+    INT tagSize = (b1 << 21) | (b2 << 14) | (b3 << 7) | b4
+    INT tagEnd  = tagSize + 10
+    INT pos = 10, fSize, headSize, k, charVal, dLen = LEN(desc)
+    STRING frameID, txt, wantID
+
+    IF version = 2 THEN wantID = "TXX" ELSE wantID = "TXXX"
+
+    WHILE pos < tagEnd - 10
+        charVal = #<BYTE>pID3[pos] & 255
+        IF charVal = 0 THEN BREAK
+
+        IF version >= 3 THEN
+            frameID = CHR$(charVal) + CHR$(#<BYTE>pID3[pos+1] & 255) + CHR$(#<BYTE>pID3[pos+2] & 255) + CHR$(#<BYTE>pID3[pos+3] & 255)
+            IF version = 4 THEN
+                fSize = ((#<BYTE>pID3[pos+4] & 0x7F) << 21) | ((#<BYTE>pID3[pos+5] & 0x7F) << 14) | ((#<BYTE>pID3[pos+6] & 0x7F) << 7) _
+| (#<BYTE>pID3[pos+7] & 0x7F)
+            ELSE
+                fSize = ((#<BYTE>pID3[pos+4] & 255) << 24) | ((#<BYTE>pID3[pos+5] & 255) << 16) | ((#<BYTE>pID3[pos+6] & 255) << 8) | _
+(#<BYTE>pID3[pos+7] & 255)
+            ENDIF
+            headSize = 10
+        ELSE
+            frameID = CHR$(charVal) + CHR$(#<BYTE>pID3[pos+1] & 255) + CHR$(#<BYTE>pID3[pos+2] & 255)
+            fSize = ((#<BYTE>pID3[pos+3] & 255) << 16) | ((#<BYTE>pID3[pos+4] & 255) << 8) | (#<BYTE>pID3[pos+5] & 255)
+            headSize = 6
+        ENDIF
+
+        IF fSize <= 0 OR (pos + headSize + fSize) > tagEnd THEN BREAK
+
+        IF frameID = wantID THEN
+            txt = ""
+            FOR k = pos + headSize + 1 TO pos + headSize + fSize - 1
+                charVal = #<BYTE>pID3[k] & 255
+                IF charVal >= 32 AND charVal < 254 AND LEN(txt) < 200 THEN txt = txt + CHR$(charVal)
+            NEXT k
+
+            ' description and value are now glued together (the NUL between them was dropped)
+            IF UCASE$(LEFT$(txt, dLen)) = UCASE$(desc) THEN
+                RETURN LTRIM$(RTRIM$(RIGHT$(txt, LEN(txt) - dLen)))
+            ENDIF
+        ENDIF
+        pos = pos + headSize + fSize
+    ENDWHILE
+    RETURN ""
+ENDSUB
+
+' Reads REPLAYGAIN_TRACK_GAIN / REPLAYGAIN_ALBUM_GAIN into the globals (FLAC Vorbis comments, then ID3v2 TXXX).
+' Not handled: APEv2 tags (mp3gain), iTunNORM, ID3v2.2 unsynchronisation.
+SUB ReadReplayGain(DWORD hStreamHandle)
+    STRING s
+    DOUBLE v
+
+    g_RGHasTrack = 0 : g_RGHasAlbum = 0
+    g_RGTrackDb = 0.0 : g_RGAlbumDb = 0.0
+    IF hStreamHandle = 0 THEN RETURN
+
+    s = GetVorbisComment(hStreamHandle, "REPLAYGAIN_TRACK_GAIN")
+    IF s = "" THEN s = GetID3v2TXXX(hStreamHandle, "REPLAYGAIN_TRACK_GAIN")
+    IF s <> "" THEN
+        v = ParseDouble(s)
+        IF g_ParseOK = 1 THEN
+            IF v > 20.0 THEN v = 20.0
+            IF v < -40.0 THEN v = -40.0
+            g_RGTrackDb = v
+            g_RGHasTrack = 1
+        ENDIF
+    ENDIF
+
+    s = GetVorbisComment(hStreamHandle, "REPLAYGAIN_ALBUM_GAIN")
+    IF s = "" THEN s = GetID3v2TXXX(hStreamHandle, "REPLAYGAIN_ALBUM_GAIN")
+    IF s <> "" THEN
+        v = ParseDouble(s)
+        IF g_ParseOK = 1 THEN
+            IF v > 20.0 THEN v = 20.0
+            IF v < -40.0 THEN v = -40.0
+            g_RGAlbumDb = v
+            g_RGHasAlbum = 1
+        ENDIF
+    ENDIF
+ENDSUB
+
+SUB RGIsActive(), INT
+    IF g_RGMode = 1 AND g_RGHasTrack = 1 THEN RETURN 1
+    IF g_RGMode = 2 AND (g_RGHasAlbum = 1 OR g_RGHasTrack = 1) THEN RETURN 1
+    RETURN 0
+ENDSUB
+
+' dB to apply (tag gain + preamp); 0.0 when not active
+SUB GetReplayGainDb(), DOUBLE
+    DOUBLE g = 0.0
+    IF RGIsActive() = 0 THEN RETURN 0.0
+    IF g_RGMode = 1 THEN
+        g = g_RGTrackDb
+    ELSE
+        IF g_RGHasAlbum = 1 THEN g = g_RGAlbumDb ELSE g = g_RGTrackDb
+    ENDIF
+    RETURN g + g_RGPreampDb
+ENDSUB
+
+SUB FormatDb(DOUBLE db), STRING
+    DOUBLE a = db
+    STRING sign = "+"
+    IF a < 0.0 THEN
+        a = -a
+        sign = "-"
+    ENDIF
+    INT t = INT((a * 10.0) + 0.5)
+    RETURN sign + LTRIM$(STR$(t / 10)) + "." + LTRIM$(STR$(t % 10)) + "dB"
+ENDSUB
+
+' ----------------------------------------------------------------------------
+' Library Handlers
+' ----------------------------------------------------------------------------
+SUB LibInit()
+    g_LibBlob = NEW(CHAR, LIB_BLOB_BYTES)
+    g_TagBuf  = NEW(CHAR, 131080)
+    g_Scratch = NEW(CHAR, 512)
+    IF g_LibBlob <> 0 THEN
+        #<BYTE>g_LibBlob[0] = 0          ' offset 0 = empty string
+        g_LibBlobUsed = 1
+    ENDIF
+ENDSUB
+
+SUB LibPut(STRING s), INT
+    IF g_LibBlob = 0 THEN RETURN 0
+    s = LEFT$(s, 100)
+    INT n = LEN(s)
+    INT off = g_LibBlobUsed
+    IF n = 0 THEN RETURN 0
+    IF off + n + 1 >= LIB_BLOB_BYTES THEN RETURN 0
+    POINTER p = g_LibBlob + off
+    #<STRING>p = s
+    #<BYTE>g_LibBlob[off + n] = 0
+    g_LibBlobUsed = off + n + 1
+    RETURN off
+ENDSUB
+
+SUB LibGet(INT off), STRING
+    IF g_LibBlob = 0 OR off <= 0 THEN RETURN ""
+    POINTER pS = g_LibBlob + off
+    RETURN #<STRING>pS
+ENDSUB
+
+SUB LE32(POINTER p, INT o), INT
+    RETURN (#<BYTE>p[o] & 255) | ((#<BYTE>p[o+1] & 255) << 8) | ((#<BYTE>p[o+2] & 255) << 16) | ((#<BYTE>p[o+3] & 255) << 24)
+ENDSUB
+
+' text of an ID3 frame body: skip encoding byte, keep bytes 32..253 (same lossy rule as GetRawID3v2)
+SUB FrameText(POINTER p, INT start, INT llen), STRING
+    INT k, c, n = 0
+    POINTER pS = g_Scratch
+    IF pS = 0 THEN RETURN ""
+    FOR k = (start + 1) TO (start + llen) - 1
+        c = #<BYTE>p[k] & 255
+        IF c >= 32 AND c < 254 THEN
+            #<BYTE>pS[n] = c
+            n = n + 1
+            IF n >= 100 THEN BREAK
+        ENDIF
+    NEXT k
+    #<BYTE>pS[n] = 0
+    STRING r = #<STRING>pS
+    RETURN LTRIM$(RTRIM$(r))
+ENDSUB
+
+' Walk ID3v2 frames in g_TagBuf (tag already read, total tag bytes = tagEnd)
+SUB ParseID3Buffer(INT version, INT tagEnd)
+    INT pos = 10, fSize, headSize, c
+    DOUBLE dv
+    STRING fid
+    WHILE pos < tagEnd - 10
+        c = #<BYTE>g_TagBuf[pos] & 255
+        IF c = 0 THEN BREAK
+        IF version >= 3 THEN
+            fid = BytesToStr(g_TagBuf, pos, 4, 0)
+            IF version = 4 THEN
+                fSize = ((#<BYTE>g_TagBuf[pos+4] & 0x7F) << 21) | ((#<BYTE>g_TagBuf[pos+5] & 0x7F) << 14) | ((#<BYTE>g_TagBuf[pos+6] & 0x7F) << 7) | (#<BYTE>g_TagBuf[pos+7] & 0x7F)
+            ELSE
+                fSize = ((#<BYTE>g_TagBuf[pos+4] & 255) << 24) | ((#<BYTE>g_TagBuf[pos+5] & 255) << 16) | ((#<BYTE>g_TagBuf[pos+6] & 255) << 8) | (#<BYTE>g_TagBuf[pos+7] & 255)
+            ENDIF
+            headSize = 10
+        ELSE
+            fid = BytesToStr(g_TagBuf, pos, 3, 0)
+            fSize = ((#<BYTE>g_TagBuf[pos+3] & 255) << 16) | ((#<BYTE>g_TagBuf[pos+4] & 255) << 8) | (#<BYTE>g_TagBuf[pos+5] & 255)
+            headSize = 6
+        ENDIF
+        IF fSize <= 0 OR (pos + headSize + fSize) > tagEnd THEN BREAK
+
+        IF fid = "TPE1" OR fid = "TP1" THEN g_TagArt = FrameText(g_TagBuf, pos + headSize, fSize)
+        IF fid = "TALB" OR fid = "TAL" THEN g_TagAlb = FrameText(g_TagBuf, pos + headSize, fSize)
+        IF fid = "TIT2" OR fid = "TT2" THEN g_TagTit = FrameText(g_TagBuf, pos + headSize, fSize)
+        IF fid = "TRCK" OR fid = "TRK" THEN
+            dv = ParseDouble(FrameText(g_TagBuf, pos + headSize, fSize))
+            IF g_ParseOK = 1 THEN g_TagTrk = INT(dv)
+        ENDIF
+        pos = pos + headSize + fSize
+    ENDWHILE
+ENDSUB
+
+' FLAC VORBIS_COMMENT block already in g_TagBuf (length len)
+SUB ParseVorbisBuffer(INT llen)
+    INT pos, cnt, i, n, eq, k, vlen
+    DOUBLE dv
+    STRING key
+    IF llen < 8 THEN RETURN
+    pos = 4 + LE32(g_TagBuf, 0)
+    IF pos < 4 OR pos + 4 > llen THEN RETURN
+    cnt = LE32(g_TagBuf, pos)
+    pos = pos + 4
+    FOR i = 1 TO cnt
+        IF pos + 4 > llen THEN BREAK
+        n = LE32(g_TagBuf, pos)
+        pos = pos + 4
+        IF n < 0 OR pos + n > llen THEN BREAK
+
+        ' find "=" within the first 40 bytes (field names are short); eq is 1-based like INSTR
+        eq = 0
+        FOR k = 0 TO n - 1
+            IF k >= 40 THEN BREAK
+            IF (#<BYTE>g_TagBuf[pos + k] & 255) = 61 THEN
+                eq = k + 1
+                BREAK
+            ENDIF
+        NEXT k
+
+        IF eq > 1 THEN
+            key  = BytesToStr(g_TagBuf, pos, eq - 1, 1)
+            vlen = n - eq
+            IF key = "ARTIST" AND g_TagArt = "" THEN g_TagArt = LTRIM$(RTRIM$(BytesToStr(g_TagBuf, pos + eq, vlen, 0)))
+            IF key = "ALBUM" AND g_TagAlb = "" THEN g_TagAlb = LTRIM$(RTRIM$(BytesToStr(g_TagBuf, pos + eq, vlen, 0)))
+            IF key = "TITLE" AND g_TagTit = "" THEN g_TagTit = LTRIM$(RTRIM$(BytesToStr(g_TagBuf, pos + eq, vlen, 0)))
+            IF key = "TRACKNUMBER" THEN
+                dv = ParseDouble(BytesToStr(g_TagBuf, pos + eq, vlen, 0))
+                IF g_ParseOK = 1 THEN g_TagTrk = INT(dv)
+            ENDIF
+        ENDIF
+        pos = pos + n
+    NEXT i
+ENDSUB
+
+' Reads artist/album/title/track of g_Playlist[idx] into g_TagArt/g_TagAlb/g_TagTit/g_TagTrk
+SUB ReadFileTags(INT idx)
+    g_TagArt = "" : g_TagAlb = "" : g_TagTit = "" : g_TagTrk = 0
+    IF g_TagBuf = 0 THEN RETURN
+
+    UINT hF = CreateFileA(g_Playlist[idx], GENERIC_READ, 1, 0, OPEN_EXISTING, 0, 0)
+    IF hF = -1 OR hF = 0 THEN RETURN
+
+    DWORD got = 0
+    INT tagSize, toRead, blkType, blkLen, isLast = 0, guard = 0
+    ReadFile(hF, g_TagBuf, 10, &got, 0)
+
+    IF got = 10 THEN
+        IF (#<BYTE>g_TagBuf[0] = 73) AND (#<BYTE>g_TagBuf[1] = 68) AND (#<BYTE>g_TagBuf[2] = 51) THEN
+            ' ---- ID3v2 ----
+            INT ver = #<BYTE>g_TagBuf[3]
+            tagSize = ((#<BYTE>g_TagBuf[6] & 0x7F) << 21) | ((#<BYTE>g_TagBuf[7] & 0x7F) << 14) | ((#<BYTE>g_TagBuf[8] & 0x7F) << 7) | (#<BYTE>g_TagBuf[9] & 0x7F)
+            toRead = tagSize
+            IF toRead > 131000 THEN toRead = 131000
+            ReadFile(hF, g_TagBuf + 10, toRead, &got, 0)
+            ParseID3Buffer(ver, toRead + 10)
+        ELSEIF (#<BYTE>g_TagBuf[0] = 102) AND (#<BYTE>g_TagBuf[1] = 76) AND (#<BYTE>g_TagBuf[2] = 97) AND (#<BYTE>g_TagBuf[3] = 67) THEN
+            ' ---- FLAC: header "fLaC" already consumed 10 bytes; step back to byte 4 ----
+            SetFilePointer(hF, 4, 0, 0)
+            WHILE isLast = 0 AND guard < 64
+                guard = guard + 1
+                ReadFile(hF, g_TagBuf, 4, &got, 0)
+                IF got <> 4 THEN BREAK
+                blkType = #<BYTE>g_TagBuf[0] & 0x7F
+                isLast  = (#<BYTE>g_TagBuf[0] & 0x80) / 128
+                blkLen  = ((#<BYTE>g_TagBuf[1] & 255) << 16) | ((#<BYTE>g_TagBuf[2] & 255) << 8) | (#<BYTE>g_TagBuf[3] & 255)
+                IF blkType = 4 AND blkLen > 0 AND blkLen <= 131000 THEN
+                    ReadFile(hF, g_TagBuf, blkLen, &got, 0)
+                    ParseVorbisBuffer(blkLen)
+                    BREAK
+                ELSE
+                    SetFilePointer(hF, blkLen, 0, 1)      ' 1 = FILE_CURRENT
+                ENDIF
+            WEND
+        ENDIF
+    ENDIF
+    CloseHandle(hF)
+
+    g_TagArt = ConvertANSItoOEM(EnsureANSI(g_TagArt))
+    g_TagAlb = ConvertANSItoOEM(EnsureANSI(g_TagAlb))
+    g_TagTit = ConvertANSItoOEM(EnsureANSI(g_TagTit))
+ENDSUB
+
+SUB LibStoreTrack(INT idx)
+    IF g_TagArt = "" THEN g_TagArt = "Unknown Artist"
+    IF g_TagAlb = "" THEN g_TagAlb = "Unknown Album"
+    IF g_TagTit = "" THEN g_TagTit = ConvertANSItoOEM(EnsureANSI(GetFileNameOnly(g_Playlist[idx])))
+    IF g_TagArt = g_PrevArt AND g_PrevArtOff > 0 THEN
+        g_LibArtOff[idx] = g_PrevArtOff
+    ELSE
+        g_PrevArtOff = LibPut(g_TagArt)
+        g_PrevArt = g_TagArt
+        g_LibArtOff[idx] = g_PrevArtOff
+    ENDIF
+    IF g_TagAlb = g_PrevAlb AND g_PrevAlbOff > 0 THEN
+        g_LibAlbOff[idx] = g_PrevAlbOff
+    ELSE
+        g_PrevAlbOff = LibPut(g_TagAlb)
+        g_PrevAlb = g_TagAlb
+        g_LibAlbOff[idx] = g_PrevAlbOff
+    ENDIF
+    g_LibTitOff[idx] = LibPut(g_TagTit)
+    g_LibTrk[idx]    = g_TagTrk
+    g_LibDone[idx]   = 1
+ENDSUB
+
+' Chunked scan: call once per frame, e.g. LibScanStep(25). Stops itself and saves the cache when finished.
+SUB LibScanStep(INT budgetMs)
+    IF g_LibActive = 0 THEN RETURN
+    DWORD t0 = GetTickCount()
+    WHILE g_LibScanned < g_TrackCount
+        IF g_LibDone[g_LibScanned] = 0 THEN
+            ReadFileTags(g_LibScanned)
+            LibStoreTrack(g_LibScanned)
+            g_LibDirty = 1
+        ENDIF
+        g_LibScanned = g_LibScanned + 1
+        IF GetTickCount() - t0 >= budgetMs THEN BREAK
+    ENDWHILE
+    IF g_LibScanned >= g_TrackCount THEN g_LibActive = 0
+ENDSUB
+
+' Cache = cplay_lib.db, one line per track IN PLAYLIST ORDER:  hash<TAB>artist<TAB>album<TAB>title<TAB>track
+' ("-" = not scanned yet)
+SUB LibSaveCache()
+    INT i
+    OutBegin(g_TrackCount * 210)
+    FOR i = 0 TO g_TrackCount - 1
+        IF g_LibDone[i] = 1 THEN
+            OutLine(LTRIM$(STR$(PathHash(g_Playlist[i]))) + CHR$(9) + LEFT$(LibGet(g_LibArtOff[i]), 60) + CHR$(9) + _
+LEFT$(LibGet(g_LibAlbOff[i]), 60) + CHR$(9) + LEFT$(LibGet(g_LibTitOff[i]), 60) + CHR$(9) + LTRIM$(STR$(g_LibTrk[i])))
+        ELSE
+            OutLine("-")
+        ENDIF
+    NEXT i
+    OutFlushToFile(GETSTARTPATH + "cplay_lib.db")
+ENDSUB
+
+' Line i is accepted only if its hash equals PathHash(g_Playlist[i]); anything else is rescanned.
+SUB LibLoadCache()
+    FILE hC
+    STRING ln
+    DOUBLE dv
+    INT i = 0, k, c, nt, t1, t2, t3, t4, fileHash, lnLen
+    POINTER pl
+    IF OPENFILE(hC, GETSTARTPATH() + "cplay_lib.db", "R") = 0 THEN
+        WHILE READ(hC, ln) = 0 AND i < g_TrackCount
+            pl = ln
+            lnLen = LEN(ln)
+            nt = 0 : t1 = 0 : t2 = 0 : t3 = 0 : t4 = 0
+            fileHash = 0
+            FOR k = 0 TO lnLen - 1
+                c = #<BYTE>pl[k] & 255
+                IF c = 9 THEN
+                    nt = nt + 1
+                    IF nt = 1 THEN t1 = k
+                    IF nt = 2 THEN t2 = k
+                    IF nt = 3 THEN t3 = k
+                    IF nt = 4 THEN t4 = k
+                ELSEIF nt = 0 THEN
+                    IF c >= 48 AND c <= 57 THEN fileHash = (fileHash * 10) + (c - 48)
+                ENDIF
+            NEXT k
+            IF nt = 4 THEN
+                IF fileHash = PathHash(g_Playlist[i]) THEN
+                    g_TagArt = MID$(ln, t1 + 2, t2 - t1 - 1)
+                    g_TagAlb = MID$(ln, t2 + 2, t3 - t2 - 1)
+                    g_TagTit = MID$(ln, t3 + 2, t4 - t3 - 1)
+                    dv = ParseDouble(MID$(ln, t4 + 2, lnLen))
+                    g_TagTrk = INT(dv)
+                    LibStoreTrack(i)
+                ENDIF
+            ENDIF
+            i = i + 1
+        ENDWHILE
+        CLOSEFILE(hC)
+    ENDIF
+ENDSUB
+
+' Copy cnt bytes of src (starting at byte 'from') into ONE string.
+' upper = 1 converts a-z to A-Z on the way. At most 120 bytes; stops at nothing else,
+' but a NUL inside the data ends the resulting string.
+SUB BytesToStr(POINTER src, INT from, INT cnt, INT upper), STRING
+    INT k, c
+    POINTER pS = g_Scratch
+    IF pS = 0 THEN RETURN ""
+    IF cnt < 0 THEN cnt = 0
+    IF cnt > 120 THEN cnt = 120
+    FOR k = 0 TO cnt - 1
+        c = #<BYTE>src[from + k] & 255
+        IF upper = 1 AND c >= 97 AND c <= 122 THEN c = c - 32
+        #<BYTE>pS[k] = c
+    NEXT k
+    #<BYTE>pS[cnt] = 0
+    STRING r = #<STRING>pS
+    RETURN r
+ENDSUB
+
+SUB PathHash(STRING s), INT
+    POINTER p = s
+    INT h = 7, i = 0, c
+    c = #<BYTE>p[0] & 255
+    WHILE c <> 0
+        h = ((h * 31) + c) % 1000003
+        i = i + 1
+        c = #<BYTE>p[i] & 255
+    ENDWHILE
+    RETURN h
+ENDSUB
+
+' Case-insensitive compare of two pool strings (by offset). -1 / 0 / 1
+SUB LibCmpStr(INT offA, INT offB), INT
+    INT ca, cb
+    IF offA = offB THEN RETURN 0
+    WHILE 1 = 1
+        ca = #<BYTE>g_LibBlob[offA] & 255
+        cb = #<BYTE>g_LibBlob[offB] & 255
+        IF ca >= 65 AND ca <= 90 THEN ca = ca + 32
+        IF cb >= 65 AND cb <= 90 THEN cb = cb + 32
+        IF ca <> cb THEN
+            IF ca < cb THEN RETURN -1
+            RETURN 1
+        ENDIF
+        IF ca = 0 THEN RETURN 0
+        offA = offA + 1
+        offB = offB + 1
+    WEND
+    RETURN 0
+ENDSUB
+
+' Artist, album, track number (0 = unnumbered, goes last), title, then playlist index
+SUB LibCmpTrack(INT a, INT b), INT
+    INT r, ta, tb
+    r = LibCmpStr(g_LibArtOff[a], g_LibArtOff[b])
+    IF r <> 0 THEN RETURN r
+    r = LibCmpStr(g_LibAlbOff[a], g_LibAlbOff[b])
+    IF r <> 0 THEN RETURN r
+    ta = g_LibTrk[a]
+    tb = g_LibTrk[b]
+    IF ta <= 0 THEN ta = 99999
+    IF tb <= 0 THEN tb = 99999
+    IF ta < tb THEN RETURN -1
+    IF ta > tb THEN RETURN 1
+    r = LibCmpStr(g_LibTitOff[a], g_LibTitOff[b])
+    IF r <> 0 THEN RETURN r
+    IF a < b THEN RETURN -1
+    IF a > b THEN RETURN 1
+    RETURN 0
+ENDSUB
+
+' Heap sort of g_LibOrder[0..n-1] (no recursion, worst case n log n)
+SUB LibSiftDown(INT startPos, INT lastPos)
+    INT root, child, swapPos, tmp
+    root = startPos
+    WHILE (root * 2) + 1 <= lastPos
+        child = (root * 2) + 1
+        swapPos = root
+        IF LibCmpTrack(g_LibOrder[swapPos], g_LibOrder[child]) < 0 THEN swapPos = child
+        IF child + 1 <= lastPos THEN
+            IF LibCmpTrack(g_LibOrder[swapPos], g_LibOrder[child + 1]) < 0 THEN swapPos = child + 1
+        ENDIF
+        IF swapPos = root THEN RETURN
+        tmp = g_LibOrder[root]
+        g_LibOrder[root] = g_LibOrder[swapPos]
+        g_LibOrder[swapPos] = tmp
+        root = swapPos
+    WEND
+ENDSUB
+
+SUB LibHeapSort(INT n)
+    INT startPos, lastPos, tmp
+    IF n < 2 THEN RETURN
+    startPos = (n - 2) / 2
+    WHILE startPos >= 0
+        LibSiftDown(startPos, n - 1)
+        startPos = startPos - 1
+    WEND
+    lastPos = n - 1
+    WHILE lastPos > 0
+        tmp = g_LibOrder[lastPos]
+        g_LibOrder[lastPos] = g_LibOrder[0]
+        g_LibOrder[0] = tmp
+        lastPos = lastPos - 1
+        LibSiftDown(0, lastPos)
+    WEND
+ENDSUB
+
+' Build the sorted order + artist ranges from every track indexed so far
+SUB LibBuildIndex()
+    INT i, n
+    n = 0
+    FOR i = 0 TO g_TrackCount - 1
+        IF g_LibDone[i] = 1 THEN
+            g_LibOrder[n] = i
+            n = n + 1
+        ENDIF
+    NEXT i
+    g_LibOrderCount = n
+    LibHeapSort(n)
+
+    g_ArtCount = 0
+    FOR i = 0 TO n - 1
+        IF i = 0 THEN
+            g_ArtFirst[g_ArtCount] = 0
+            g_ArtCount = g_ArtCount + 1
+        ELSEIF LibCmpStr(g_LibArtOff[g_LibOrder[i - 1]], g_LibArtOff[g_LibOrder[i]]) <> 0 THEN
+            g_ArtFirst[g_ArtCount] = i
+            g_ArtCount = g_ArtCount + 1
+        ENDIF
+    NEXT i
+    g_ArtFirst[g_ArtCount] = n
+    g_AlbArtist = -1
+    g_LibIndexBuilt = 1
+    g_LibIndexBuiltFor = n
+ENDSUB
+
+' Rebuilds only when the number of indexed tracks changed since the last build
+SUB LibEnsureIndex()
+    INT i, n
+    n = 0
+    FOR i = 0 TO g_TrackCount - 1
+        IF g_LibDone[i] = 1 THEN n = n + 1
+    NEXT i
+    IF g_LibIndexBuilt = 0 OR n <> g_LibIndexBuiltFor THEN LibBuildIndex()
+ENDSUB
+
+' Album ranges of ONE artist (artist number k from the artist list) ----
+SUB LibBuildAlbums(INT artistK)
+    INT p, lo, hi
+    g_AlbCount = 0
+    g_AlbArtist = -1
+    IF artistK < 0 OR artistK >= g_ArtCount THEN RETURN
+    lo = g_ArtFirst[artistK]
+    hi = g_ArtFirst[artistK + 1]
+    FOR p = lo TO hi - 1
+        IF p = lo THEN
+            g_AlbFirst[g_AlbCount] = p
+            g_AlbCount = g_AlbCount + 1
+        ELSEIF LibCmpStr(g_LibAlbOff[g_LibOrder[p - 1]], g_LibAlbOff[g_LibOrder[p]]) <> 0 THEN
+            g_AlbFirst[g_AlbCount] = p
+            g_AlbCount = g_AlbCount + 1
+        ENDIF
+    NEXT p
+    g_AlbFirst[g_AlbCount] = hi
+    g_AlbArtist = artistK
+ENDSUB
+
+' Accessors for the screen (part C). All counts/names come from the sorted pool
+SUB LibArtistName(INT k), STRING
+    IF k < 0 OR k >= g_ArtCount THEN RETURN ""
+    RETURN LibGet(g_LibArtOff[g_LibOrder[g_ArtFirst[k]]])
+ENDSUB
+
+SUB LibArtistTracks(INT k), INT
+    IF k < 0 OR k >= g_ArtCount THEN RETURN 0
+    RETURN g_ArtFirst[k + 1] - g_ArtFirst[k]
+ENDSUB
+
+' Album j of the artist last passed to LibBuildAlbums
+SUB LibAlbumName(INT j), STRING
+    IF j < 0 OR j >= g_AlbCount THEN RETURN ""
+    RETURN LibGet(g_LibAlbOff[g_LibOrder[g_AlbFirst[j]]])
+ENDSUB
+
+SUB LibAlbumTracks(INT j), INT
+    IF j < 0 OR j >= g_AlbCount THEN RETURN 0
+    RETURN g_AlbFirst[j + 1] - g_AlbFirst[j]
+ENDSUB
+
+' Playlist index of track number t (0-based) of album j (current artist)
+SUB LibAlbumTrackIdx(INT j, INT t), INT
+    IF j < 0 OR j >= g_AlbCount THEN RETURN -1
+    IF t < 0 OR t >= g_AlbFirst[j + 1] - g_AlbFirst[j] THEN RETURN -1
+    RETURN g_LibOrder[g_AlbFirst[j] + t]
+ENDSUB
+
+' Tag search: artist OR album OR title contains the text (case-insensitive)
+SUB LibFieldHas(INT off, POINTER pQuery, INT qlen), INT
+    INT s, k, ca, cq
+    IF off <= 0 THEN RETURN 0
+    s = 0
+    WHILE (#<BYTE>g_LibBlob[off + s]) <> 0
+        k = 0
+        WHILE k < qlen
+            ca = #<BYTE>g_LibBlob[off + s + k] & 255
+            IF ca = 0 THEN RETURN 0                 ' ran off the end: no later start can match either
+            IF ca >= 65 AND ca <= 90 THEN ca = ca + 32
+            cq = #<BYTE>pQuery[k] & 255
+            IF ca <> cq THEN BREAK
+            k = k + 1
+        WEND
+        IF k = qlen THEN RETURN 1
+        s = s + 1
+    WEND
+    RETURN 0
+ENDSUB
+
+' Text of list row 'sel' for the current g_RowKind (OEM text, same as the console shows)
+SUB BrItemText(INT sel), STRING
+    INT it, n, typ, v, idx
+    STRING t
+    IF sel < 0 OR sel >= g_FilteredCount THEN RETURN ""
+    it = g_FilteredIndices[sel]
+
+    IF g_RowKind = 4 THEN
+        typ = it / 10000000
+        v = it % 10000000
+        IF typ = 1 THEN
+            RETURN "[Artist] " + LibArtistName(v) + "  (" + LTRIM$(STR$(LibArtistTracks(v))) + ")"
+        ENDIF
+        IF typ = 2 THEN
+            idx = g_LibOrder[v]
+            RETURN "[Album]  " + LibGet(g_LibArtOff[idx]) + " - " + LibGet(g_LibAlbOff[idx]) + "  (" + _
+LTRIM$(STR$(BrAlbumEnd(v) - v)) + ")"
+        ENDIF
+        t = LibGet(g_LibTitOff[v])
+        IF t = "" THEN t = ConvertANSItoOEM(EnsureANSI(GetFileNameOnly(g_Playlist[v])))
+        RETURN "[Song]   " + LibGet(g_LibArtOff[v]) + " - " + t
+    ENDIF
+
+    IF g_RowKind = 1 THEN
+        RETURN LibArtistName(it) + "  (" + LTRIM$(STR$(LibArtistTracks(it))) + ")"
+    ENDIF
+    IF g_RowKind = 2 THEN
+        RETURN LibAlbumName(it) + "  (" + LTRIM$(STR$(LibAlbumTracks(it))) + ")"
+    ENDIF
+    IF g_RowKind = 3 THEN
+        t = LibGet(g_LibTitOff[it])
+        IF t = "" THEN t = ConvertANSItoOEM(EnsureANSI(GetFileNameOnly(g_Playlist[it])))
+        n = g_LibTrk[it]
+        IF n > 0 THEN RETURN RIGHT$("  " + LTRIM$(STR$(n)), 2) + ". " + t
+        RETURN "    " + t
+    ENDIF
+    RETURN ConvertANSItoOEM(EnsureANSI(GetFileNameOnly(g_Playlist[g_FilteredIndices[sel]])))
+ENDSUB
+
+' Header label for the current level
+SUB BrTitle(), STRING
+    IF g_RowKind = 0 THEN RETURN "BROWSE PLAYLIST"
+    IF g_RowKind = 4 THEN
+        RETURN "SEARCH: " + LTRIM$(STR$(g_SrArt)) + " artists, " + LTRIM$(STR$(g_SrAlb)) + " albums, " + _
+LTRIM$(STR$(g_SrSong)) + " songs"
+    ENDIF
+    IF g_BrMode = 1 THEN RETURN "LIBRARY: ARTISTS"
+    IF g_BrMode = 2 THEN RETURN "ARTIST: " + LEFT$(LibArtistName(g_BrArtist), 40)
+    RETURN LEFT$(LibArtistName(g_BrArtist), 24) + " / " + LEFT$(LibAlbumName(g_BrAlbum), 30)
+ENDSUB
+
+' (re)Build the sorted index if tracks were indexed since last time; drop back to a safe level if it changed
+SUB BrEnsure()
+    INT before = g_LibIndexBuiltFor
+    LibEnsureIndex()
+    IF g_LibOrderCount = 0 THEN
+        g_BrMode = 0
+        RETURN
+    ENDIF
+    IF g_LibIndexBuiltFor <> before THEN
+        IF g_BrMode > 1 THEN
+            g_BrMode = 1
+            g_PlaylistSelectIdx = 0
+            g_PlaylistScrollOffset = 0
+        ENDIF
+    ENDIF
+ENDSUB
+
+' Put the cursor on the track that is playing (files list or album list); harmless if it is not in the list
+SUB BrSyncPlaying()
+    INT i
+    IF g_RowKind <> 0 AND g_RowKind <> 3 THEN RETURN
+    FOR i = 0 TO g_FilteredCount - 1
+        IF g_FilteredIndices[i] = argIdx THEN
+            g_PlaylistSelectIdx = i
+            g_PlaylistScrollOffset = i - 9
+            IF g_FilteredCount <= 19 THEN
+                g_PlaylistScrollOffset = 0
+            ELSE
+                IF g_PlaylistScrollOffset + 19 > g_FilteredCount THEN g_PlaylistScrollOffset = g_FilteredCount - 19
+                IF g_PlaylistScrollOffset < 0 THEN g_PlaylistScrollOffset = 0
+            ENDIF
+            BREAK
+        ENDIF
+    NEXT i
+    plMarqueeOffset = 0
+    plMarqueeTick = 0
+    InitPlMarqueeRing()
+ENDSUB
+
+' Tab: Files <-> Library
+SUB BrToggle()
+    g_SearchBuf = ""
+    g_PlaylistSelectIdx = 0
+    g_PlaylistScrollOffset = 0
+    IF g_BrMode = 0 THEN
+        g_BrMode = 1
+        BrEnsure()
+    ELSE
+        g_BrMode = 0
+    ENDIF
+    FilterPlaylist()
+    IF g_BrMode = 0 THEN BrSyncPlaying()
+    DrawPlaylistScreen()
+ENDSUB
+
+' Enter. Returns 1 when a track must start playing (the caller does g_ManualJump / skipTrack / RedrawPlayerView),
+' 0 when it only moved down a level.
+' Enter. Returns 1 when a track must start playing, 0 when it only moved to another list.
+SUB BrActivate(), INT
+    INT sel, it, p, typ, v, k, j
+    sel = g_PlaylistSelectIdx
+    IF g_FilteredCount <= 0 OR sel < 0 OR sel >= g_FilteredCount THEN RETURN 0
+    it = g_FilteredIndices[sel]
+
+    IF g_RowKind = 4 THEN
+        typ = it / 10000000
+        v = it % 10000000
+        IF typ = 3 THEN                          ' song: play it, then the songs below it in the result list
+            g_PriorityCount = 0
+            FOR p = sel TO g_FilteredCount - 1
+                IF g_FilteredIndices[p] / 10000000 = 3 THEN
+                    g_PriorityQueue[g_PriorityCount] = g_FilteredIndices[p] % 10000000
+                    g_PriorityCount = g_PriorityCount + 1
+                ENDIF
+            NEXT p
+            g_PriorityIdx = 0
+            RETURN 1
+        ENDIF
+
+        IF typ = 1 THEN                          ' artist -> its albums
+            k = v
+            g_BrArtist = k
+            g_BrSelArt = k                       ' position in the artist list = artist number
+            g_BrMode = 2
+        ELSE                                     ' album -> its tracks
+            k = BrArtistOfPos(v)
+            g_BrArtist = k
+            g_BrSelArt = k
+            LibBuildAlbums(k)
+            g_BrAlbum = 0
+            FOR j = 0 TO g_AlbCount - 1
+                IF g_AlbFirst[j] = v THEN
+                    g_BrAlbum = j
+                    BREAK
+                ENDIF
+            NEXT j
+            g_BrSelAlb = g_BrAlbum               ' position in the album list = album number
+            g_BrMode = 3
+        ENDIF
+        g_SearchBuf = ""
+        g_SearchActive = 0
+        g_PlaylistSelectIdx = 0
+        g_PlaylistScrollOffset = 0
+        FilterPlaylist()
+        DrawPlaylistScreen()
+        RETURN 0
+    ENDIF
+
+    IF g_RowKind = 1 THEN
+        g_BrArtist = it
+        g_BrSelArt = sel
+        g_BrMode = 2
+        g_SearchActive = 0
+        g_PlaylistSelectIdx = 0
+        g_PlaylistScrollOffset = 0
+        FilterPlaylist()
+        DrawPlaylistScreen()
+        RETURN 0
+    ENDIF
+
+    IF g_RowKind = 2 THEN
+        g_BrAlbum = it
+        g_BrSelAlb = sel
+        g_BrMode = 3
+        g_SearchActive = 0
+        g_PlaylistSelectIdx = 0
+        g_PlaylistScrollOffset = 0
+        FilterPlaylist()
+        DrawPlaylistScreen()
+        RETURN 0
+    ENDIF
+
+    IF g_RowKind = 3 THEN
+        g_PriorityCount = 0
+        FOR p = sel TO g_FilteredCount - 1
+            g_PriorityQueue[g_PriorityCount] = g_FilteredIndices[p]
+            g_PriorityCount = g_PriorityCount + 1
+        NEXT p
+        g_PriorityIdx = 0
+        RETURN 1
+    ENDIF
+
+    argIdx = it                                  ' files list: old behaviour
+    g_PriorityIdx = -1
+    g_PriorityCount = 0
+    RETURN 1
+ENDSUB
+
+' P. Returns 1 when playback must start.
+SUB BrPlayHere(), INT
+    INT sel, it, p, lo, hi, typ, v
+    sel = g_PlaylistSelectIdx
+    IF g_FilteredCount <= 0 OR sel < 0 OR sel >= g_FilteredCount THEN RETURN 0
+    it = g_FilteredIndices[sel]
+    g_PriorityCount = 0
+
+    IF g_RowKind = 4 THEN
+        typ = it / 10000000
+        v = it % 10000000
+        IF typ = 1 THEN
+            lo = g_ArtFirst[v]
+            hi = g_ArtFirst[v + 1]
+        ELSEIF typ = 2 THEN
+            lo = v
+            hi = BrAlbumEnd(v)
+        ELSE
+            lo = 0
+            hi = 0
+            FOR p = 0 TO g_FilteredCount - 1
+                IF g_FilteredIndices[p] / 10000000 = 3 THEN
+                    g_PriorityQueue[g_PriorityCount] = g_FilteredIndices[p] % 10000000
+                    g_PriorityCount = g_PriorityCount + 1
+                ENDIF
+            NEXT p
+        ENDIF
+        FOR p = lo TO hi - 1
+            g_PriorityQueue[g_PriorityCount] = g_LibOrder[p]
+            g_PriorityCount = g_PriorityCount + 1
+        NEXT p
+    ELSEIF g_RowKind = 1 THEN
+        FOR p = g_ArtFirst[it] TO g_ArtFirst[it + 1] - 1
+            g_PriorityQueue[g_PriorityCount] = g_LibOrder[p]
+            g_PriorityCount = g_PriorityCount + 1
+        NEXT p
+    ELSEIF g_RowKind = 2 THEN
+        FOR p = g_AlbFirst[it] TO g_AlbFirst[it + 1] - 1
+            g_PriorityQueue[g_PriorityCount] = g_LibOrder[p]
+            g_PriorityCount = g_PriorityCount + 1
+        NEXT p
+    ELSE
+        FOR p = 0 TO g_FilteredCount - 1
+            g_PriorityQueue[g_PriorityCount] = g_FilteredIndices[p]
+            g_PriorityCount = g_PriorityCount + 1
+        NEXT p
+    ENDIF
+    IF g_PriorityCount = 0 THEN RETURN 0
+    g_PriorityIdx = 0
+    RETURN 1
+ENDSUB
+
+' Esc without a search text. Returns 1 when the screen must be left, 0 when it went up one level.
+SUB BrBack(), INT
+    IF g_BrMode = 3 THEN
+        g_BrMode = 2
+        g_PlaylistSelectIdx = g_BrSelAlb
+        FilterPlaylist()
+        DrawPlaylistScreen()
+        RETURN 0
+    ENDIF
+    IF g_BrMode = 2 THEN
+        g_BrMode = 1
+        g_PlaylistSelectIdx = g_BrSelArt
+        FilterPlaylist()
+        DrawPlaylistScreen()
+        RETURN 0
+    ENDIF
+    RETURN 1
+ENDSUB
+
+' Library part of FilterPlaylist
+SUB BrFillLibrary(STRING cleanQuery)
+    INT i, n
+    g_BrSearchRes = 0
+    g_FilteredCount = 0
+
+    IF LEN(cleanQuery) >= 3 THEN                ' typed search wins at any level
+        BrSearchMixed(cleanQuery)
+        g_RowKind = 4
+        g_BrSearchRes = 1
+        RETURN
+    ENDIF
+
+    IF g_BrMode = 1 THEN
+        FOR i = 0 TO g_ArtCount - 1
+            g_FilteredIndices[i] = i
+        NEXT i
+        g_FilteredCount = g_ArtCount
+        g_RowKind = 1
+        RETURN
+    ENDIF
+
+    IF g_AlbArtist <> g_BrArtist THEN LibBuildAlbums(g_BrArtist)
+
+    IF g_BrMode = 2 THEN
+        FOR i = 0 TO g_AlbCount - 1
+            g_FilteredIndices[i] = i
+        NEXT i
+        g_FilteredCount = g_AlbCount
+        g_RowKind = 2
+        RETURN
+    ENDIF
+
+    n = LibAlbumTracks(g_BrAlbum)
+    FOR i = 0 TO n - 1
+        g_FilteredIndices[i] = LibAlbumTrackIdx(g_BrAlbum, i)
+    NEXT i
+    g_FilteredCount = n
+    g_RowKind = 3
+ENDSUB
+
+' Index of the first track AFTER the album that starts at order position p
+SUB BrAlbumEnd(INT p), INT
+    INT q, a, b
+    q = p + 1
+    a = g_LibOrder[p]
+    WHILE q < g_LibOrderCount
+        b = g_LibOrder[q]
+        IF LibCmpStr(g_LibArtOff[a], g_LibArtOff[b]) <> 0 THEN BREAK
+        IF LibCmpStr(g_LibAlbOff[a], g_LibAlbOff[b]) <> 0 THEN BREAK
+        q = q + 1
+    WEND
+    RETURN q
+ENDSUB
+
+' Artist number whose range contains order position p (binary search in g_ArtFirst)
+SUB BrArtistOfPos(INT p), INT
+    INT lo = 0, hi = g_ArtCount - 1, mid
+    WHILE lo < hi
+        mid = (lo + hi + 1) / 2
+        IF g_ArtFirst[mid] <= p THEN
+            lo = mid
+        ELSE
+            hi = mid - 1
+        ENDIF
+    WEND
+    RETURN lo
+ENDSUB
+
+' Mixed search: artists, then albums, then songs
+SUB BrSearchMixed(STRING queryText)
+    INT i, k, c, qlen, p, a, b, startsAlbum
+    POINTER pQuery = g_Scratch + 256
+    POINTER pSrc = queryText
+    g_FilteredCount = 0
+    g_SrArt = 0 : g_SrAlb = 0 : g_SrSong = 0
+    qlen = LEN(queryText)
+    IF qlen > 40 THEN qlen = 40
+    IF qlen = 0 THEN RETURN
+    FOR k = 0 TO qlen - 1
+        c = #<BYTE>pSrc[k] & 255
+        IF c >= 65 AND c <= 90 THEN c = c + 32
+        #<BYTE>pQuery[k] = c
+    NEXT k
+
+    ' artists
+    FOR i = 0 TO g_ArtCount - 1
+        IF g_FilteredCount >= MAX_PLAYLIST - 1 THEN BREAK
+        IF LibFieldHas(g_LibArtOff[g_LibOrder[g_ArtFirst[i]]], pQuery, qlen) = 1 THEN
+            g_FilteredIndices[g_FilteredCount] = 10000000 + i
+            g_FilteredCount = g_FilteredCount + 1
+            g_SrArt = g_SrArt + 1
+        ENDIF
+    NEXT i
+
+    ' albums (an album starts where artist or album name changes in the sorted order)
+    FOR p = 0 TO g_LibOrderCount - 1
+        IF g_FilteredCount >= MAX_PLAYLIST - 1 THEN BREAK
+        b = g_LibOrder[p]
+        startsAlbum = 0
+        IF p = 0 THEN
+            startsAlbum = 1
+        ELSE
+            a = g_LibOrder[p - 1]
+            IF LibCmpStr(g_LibArtOff[a], g_LibArtOff[b]) <> 0 THEN
+                startsAlbum = 1
+            ELSEIF LibCmpStr(g_LibAlbOff[a], g_LibAlbOff[b]) <> 0 THEN
+                startsAlbum = 1
+            ENDIF
+        ENDIF
+        IF startsAlbum = 1 THEN
+            IF LibFieldHas(g_LibAlbOff[b], pQuery, qlen) = 1 THEN
+                g_FilteredIndices[g_FilteredCount] = 20000000 + p
+                g_FilteredCount = g_FilteredCount + 1
+                g_SrAlb = g_SrAlb + 1
+            ENDIF
+        ENDIF
+    NEXT p
+
+    ' songs (title only)
+    FOR p = 0 TO g_LibOrderCount - 1
+        IF g_FilteredCount >= MAX_PLAYLIST - 1 THEN BREAK
+        b = g_LibOrder[p]
+        IF LibFieldHas(g_LibTitOff[b], pQuery, qlen) = 1 THEN
+            g_FilteredIndices[g_FilteredCount] = 30000000 + b
+            g_FilteredCount = g_FilteredCount + 1
+            g_SrSong = g_SrSong + 1
+        ENDIF
+    NEXT p
+ENDSUB
+
+' ----------------------------------------------------------------------------
+' Buffered File Writing
+' ---------------------------------------------------------------------------- 
+SUB OutBegin(INT capBytes)
+    IF g_OutBuf <> 0 THEN DELETE g_OutBuf
+    g_OutBuf = NEW(CHAR, capBytes + 16)
+    g_OutCap = capBytes
+    g_OutLen = 0
+ENDSUB
+
+SUB OutLine(STRING s)
+    INT n = LEN(s)
+    IF g_OutBuf = 0 THEN RETURN
+    IF g_OutLen + n + 2 > g_OutCap THEN RETURN      ' never overruns the buffer
+    POINTER p = g_OutBuf + g_OutLen
+    IF n > 0 THEN #<STRING>p = s
+    g_OutLen = g_OutLen + n
+    #<BYTE>g_OutBuf[g_OutLen] = 13
+    #<BYTE>g_OutBuf[g_OutLen + 1] = 10
+    g_OutLen = g_OutLen + 2
+ENDSUB
+
+SUB OutFlushToFile(STRING destPath), INT
+    IF g_OutBuf = 0 THEN RETURN 0
+    UINT hF = CreateFileA(destPath, GENERIC_WRITE, 0, 0, 2, 0x80, 0)   ' 2 = CREATE_ALWAYS, 0x80 = FILE_ATTRIBUTE_NORMAL
+    IF hF = -1 OR hF = 0 THEN
+        DELETE g_OutBuf
+        g_OutBuf = 0
+        RETURN 0
+    ENDIF
+    DWORD written = 0
+    WriteFile(hF, g_OutBuf, g_OutLen, &written, 0)
+    CloseHandle(hF)
+    DELETE g_OutBuf
+    g_OutBuf = 0
+    IF written = g_OutLen THEN RETURN 1
+    RETURN 0
 ENDSUB
 
 ' ----------------------------------------------------------------------------
@@ -4329,6 +5938,7 @@ gdiInput.DebugEventCallback = 0
 gdiInput.SuppressBackgroundThread = 0
 gdiInput.SuppressExternalCodecs = 0
 GdiplusStartup(&gdiToken, &gdiInput, 0)
+
 SetProcessDPIAware()
 cliArgCount = argc()
 cliArg = GetCommandText()
@@ -4355,15 +5965,17 @@ IF cliArgCount > 2 OR cliArg = "" THEN
     PRINT " (-/    (-|__) (-|     (-/_| (-\_/  "
     PRINT "  _\__,  _|     _|__,  _/  |,  _|,  "
     PRINT " (      (      (      (       (     "
-    PRINT " Fast Console Audio Player      v2.5"
-    PRINT " (c) Y. Dalissier"
+    PRINT " Fast Console Audio Player      v2.6"
+    PRINT " " + CHR$(184) + " Y. Dalissier"
     PRINT ""
-    PRINT "Usage:"
+    PRINT " Usage:"
     PRINT "  cplay.exe <file.flac>"
     PRINT "  cplay.exe <playlist.m3u>"
-    PRINT "  cplay.exe \"C:\\Music\\*.mp3\"             (recursive)" 
+    PRINT "  cplay.exe \"C:\\Music\\*.mp3\"               (recursive)" 
     PRINT "  cplay.exe -r   (resume cplay.m3u session & position)"
     PRINT ""
+    PRINT " Wildcards (* and ?) are supported in the FILE NAME part only,"
+    PRINT " and not in folder names."
     RestoreConsoleScreen()
     CLOSECONSOLE
     END
@@ -4375,11 +5987,12 @@ InitEQFrequencies()
 
 SetConsoleTitleA(cliArg)
 PRINT "Loading : Please Wait ..."
+
 ProcessArgument(cliArg)
 
 IF g_TrackCount = 0 THEN
-    PRINT "Error: No matching audio files found."
     RestoreConsoleScreen()
+    PRINT "Error: No matching audio files found."
     CLOSECONSOLE : END
 ENDIF
 
@@ -4388,21 +6001,26 @@ IF g_TrackCount > 0 THEN
     CalculateTotalPlaylistDuration()
 ENDIF
 
+LibInit()                ' Init TAGS Cache
+LibLoadCache()           ' Load the cache if it is there
+g_LibScanned = 0 : g_LibActive = 1
+
 EnsureDefaultEQProfiles()
 EnumerateAudioDevices()  ' 1. Scan available BASS soundcards FIRST
 LoadConfig()             ' 2. Read saved device_idx from cplay.ini SECOND
 
 ' 3. Now initialize the engine with the restored g_SelectedDevice
 IF InitAudioEngine() = 0 THEN
-    PRINT "Error: Failed to initialize BASS audio driver."
     RestoreConsoleScreen()
+    PRINT "Error: Failed to initialize BASS audio driver."
     CLOSECONSOLE : END
 ENDIF
 
+InitSpectrumConfig()
 SetTheme()
 
 ' If launched with -r, force Resume Mode active
-IF isResumeMode = 1 THEN g_ResumePos = 1
+IF g_isResumeMode = 1 THEN g_ResumePos = 1
 
 ' Restore track index if resume is active and index is within valid bounds
 IF g_ResumePos = 1 AND g_LastTrackIdx >= 0 AND g_LastTrackIdx < g_TrackCount THEN
@@ -4429,6 +6047,7 @@ timeBeginPeriod(1)
 
 WHILE argIdx < g_TrackCount
 
+    DiscardPreload()     ' a preload made for a track we are no longer heading to is stale
     pTrack = g_Playlist[argIdx]
 
     ' 1. Create stream FIRST
@@ -4610,6 +6229,9 @@ WHILE argIdx < g_TrackCount
                         FlushExtendedRegion(g_hConsole)
                     ENDIF
 
+                   ' 7b. Spectrum analyzer panel
+                   IF g_ExtDisplay = 4 THEN UpdateSpectrum(hStream, playingState)
+
                     ' 8. Window Restoration Cover Art Check
                     UINT conHwnd = GetConsoleWindow()
                     IF IsIconic(conHwnd) <> 0 THEN
@@ -4704,6 +6326,14 @@ WHILE argIdx < g_TrackCount
                                 ENDIF
                             ELSE : plPgDnPushed = 0 : ENDIF
 
+                            ' --- Tab (0x09): Files <-> Library ---
+                            IF (GetAsyncKeyState(0x09) & 0x8000) <> 0 THEN
+                                IF plTabPushed = 0 THEN
+                                    plTabPushed = 1
+                                    IF g_SearchActive = 0 THEN BrToggle()
+                                ENDIF
+                            ELSE : plTabPushed = 0 : ENDIF
+
                             ' --- Keyboard Actions ---
                             SELECT g_SearchActive
                                 CASE 1 ' --- SEARCH TYPING MODE (Debounced) ---
@@ -4714,13 +6344,10 @@ WHILE argIdx < g_TrackCount
                                         INT keyAsc = ASC(keyPress)
 
                                         SELECT keyAsc
-                                            CASE 13 ' [Enter] - Immediate Force Filter & Play Selected
+                                            CASE 13 ' [Enter] - Immediate Force Filter & Open/Play Selected
                                                 g_SearchDebounceTick = 0
                                                 FilterPlaylist()
-                                                IF g_FilteredCount > 0 THEN
-                                                    argIdx = g_FilteredIndices[g_PlaylistSelectIdx]
-                                                    g_PriorityIdx = -1
-                                                    g_PriorityCount = 0
+                                                IF BrActivate() = 1 THEN
                                                     g_ManualJump = 1
                                                     skipTrack = 1
                                                     RedrawPlayerView()
@@ -4776,23 +6403,14 @@ WHILE argIdx < g_TrackCount
 
                                             CASE 112 ' [p]
                                             CASE& 80  ' [P]
-                                                IF g_FilteredCount > 0 THEN
-                                                    INT pIdx
-                                                    g_PriorityCount = g_FilteredCount
-                                                    FOR pIdx = 0 TO g_FilteredCount - 1
-                                                        g_PriorityQueue[pIdx] = g_FilteredIndices[pIdx]
-                                                    NEXT pIdx
-                                                    g_PriorityIdx = 0
+                                                IF BrPlayHere() = 1 THEN
                                                     g_ManualJump = 1
                                                     skipTrack = 1
                                                     RedrawPlayerView()
                                                 ENDIF
 
                                             CASE 13 ' [Enter]
-                                                IF g_FilteredCount > 0 THEN
-                                                    argIdx = g_FilteredIndices[g_PlaylistSelectIdx]
-                                                    g_PriorityIdx = -1
-                                                    g_PriorityCount = 0
+                                                IF BrActivate() = 1 THEN
                                                     g_ManualJump = 1
                                                     skipTrack = 1
                                                     RedrawPlayerView()
@@ -4803,8 +6421,7 @@ WHILE argIdx < g_TrackCount
                                                     g_SearchBuf = ""
                                                     FilterPlaylist()
                                                     DrawPlaylistScreen()
-                                                ELSE
-                                                    ' Reset volume input flags before leaving screen context
+                                                ELSEIF BrBack() = 1 THEN
                                                     upDown = 0 : downDown = 0
                                                     RedrawPlayerView()
                                                 ENDIF
@@ -4840,7 +6457,7 @@ WHILE argIdx < g_TrackCount
                                             ApplyAudioAttributes(hStream)
                                             DrawMoreOptionsScreen()
                                         CASE 1 ' Mono Downmix Toggle
-                                            g_MonoDownmix = 1 - g_MonoDownmix
+                                            ToggleMonoDownmix()
                                             DrawMoreOptionsScreen()
                                         CASE 2 ' Output Device Prev
                                             IF g_SelectedDevice > 0 THEN SwitchAudioOutputDevice(g_SelectedDevice - 1)
@@ -4867,7 +6484,7 @@ WHILE argIdx < g_TrackCount
                                             ApplyAudioAttributes(hStream)
                                             DrawMoreOptionsScreen()
                                         CASE 1 ' Mono Downmix Toggle
-                                            g_MonoDownmix = 1 - g_MonoDownmix
+                                            ToggleMonoDownmix()
                                             DrawMoreOptionsScreen()
                                         CASE 2 ' Output Device Next
                                             IF g_SelectedDevice < g_AudioDeviceCount - 1 THEN SwitchAudioOutputDevice(g_SelectedDevice + 1)
@@ -4893,17 +6510,7 @@ WHILE argIdx < g_TrackCount
                                         SELECT g_MoreFocus
                                             CASE 0 : g_Balance = 0 : ApplyAudioAttributes(hStream)
                                             CASE 1
-                                                g_MonoDownmix = 1 - g_MonoDownmix
-                                                IF hStream <> 0 THEN
-                                                    QWORD curPos = BASS_ChannelGetPosition(hStream)
-                                                    INT isPlay = BASS_ChannelIsActive(hStream)
-                                                    BASS_ChannelStop(hStream)
-                                                    BASS_StreamFree(hStream)
-                                                    hStream = CreateTrackStream(g_Playlist[argIdx])
-                                                    ApplyAllDSP(hStream)
-                                                    BASS_ChannelSetPosition(hStream, curPos)
-                                                    IF isPlay = BASS_ACTIVE_PLAYING THEN BASS_ChannelPlay(hStream, 0)
-                                                ENDIF
+                                                ToggleMonoDownmix()
                                              CASE 2 ' Cycle through available devices
                                                 INT nextDev = (g_SelectedDevice + 1) % g_AudioDeviceCount
                                                 SwitchAudioOutputDevice(nextDev)
@@ -5080,8 +6687,9 @@ WHILE argIdx < g_TrackCount
                                                 optLeftDown = 1
                                                 IF g_EqGains[g_SelectedEqBand] > -12 THEN
                                                     g_EqGains[g_SelectedEqBand] = g_EqGains[g_SelectedEqBand] - 0.5
-                                                    UpdateBASSBand(g_SelectedEqBand)
                                                     RecalculateEqPrecut()
+                                                    UpdateBASSBand(g_SelectedEqBand)
+                                                    UpdateStreamVolume(hStream)
                                                     DrawOptionsScreen()
                                                 ENDIF
                                             ENDIF
@@ -5094,8 +6702,9 @@ WHILE argIdx < g_TrackCount
                                                 optRightDown = 1
                                                 IF g_EqGains[g_SelectedEqBand] < 12 THEN
                                                     g_EqGains[g_SelectedEqBand] = g_EqGains[g_SelectedEqBand] + 0.5
-                                                    UpdateBASSBand(g_SelectedEqBand)
                                                     RecalculateEqPrecut()
+                                                    UpdateBASSBand(g_SelectedEqBand)
+                                                    UpdateStreamVolume(hStream)
                                                     DrawOptionsScreen()
                                                 ENDIF
                                             ENDIF
@@ -5142,6 +6751,38 @@ WHILE argIdx < g_TrackCount
                                 ENDIF
                             ENDSELECT
 
+                       CASE 4
+                          ' ================================================
+                          ' HELP OVERLAY INPUT (g_InOptionsView = 4)
+                          ' ================================================
+                           IF (GetAsyncKeyState(0x70) & 0x8000) <> 0 THEN
+                               IF f1Down = 0 THEN
+                                   f1Down = 1
+                                   upDown = 0 : downDown = 0
+                                   RedrawPlayerView()
+                               ENDIF
+                           ELSE
+                               f1Down = 0
+                           ENDIF
+
+                           keyPress = LCASE$(INKEY$)
+                           IF keyPress <> "" THEN
+                               SELECT keyPress
+                                   CASE CHR$(27)
+                                       upDown = 0 : downDown = 0
+                                       RedrawPlayerView()
+                                   CASE "?"
+                                       upDown = 0 : downDown = 0
+                                       RedrawPlayerView()
+                                   CASE "h"
+                                       upDown = 0 : downDown = 0
+                                       RedrawPlayerView()
+                                   CASE CHR$(13)
+                                       upDown = 0 : downDown = 0
+                                       RedrawPlayerView()
+                               ENDSELECT
+                           ENDIF
+
                         CASE 0
                             ' ================================================
                             ' PLAYER VIEW HARDWARE & KEYBOARD INPUT (g_InOptionsView = 0)
@@ -5149,7 +6790,7 @@ WHILE argIdx < g_TrackCount
                             IF (GetAsyncKeyState(0x25) & 0x8000) <> 0 THEN
                                 IF leftDown = 0 THEN
                                     leftDown = 1
-                                    offsetBytes = 5.0 * (g_chanInfo.freq * g_chanInfo.chans * 2.0)
+                                    offsetBytes = GetSeekStepSecs() * (g_chanInfo.freq * g_chanInfo.chans * 2.0)
                                     IF currentPosBytes > offsetBytes THEN newPosBytes = currentPosBytes - offsetBytes ELSE newPosBytes = 0q
                                     BASS_ChannelSetPosition(hStream, newPosBytes)
                                 ENDIF
@@ -5160,7 +6801,7 @@ WHILE argIdx < g_TrackCount
                             IF (GetAsyncKeyState(0x27) & 0x8000) <> 0 THEN
                                 IF rightDown = 0 THEN
                                     rightDown = 1
-                                    offsetBytes = 5.0 * (g_chanInfo.freq * g_chanInfo.chans * 2.0)
+                                    offsetBytes = GetSeekStepSecs() * (g_chanInfo.freq * g_chanInfo.chans * 2.0)
                                     newPosBytes = currentPosBytes + offsetBytes
                                     IF newPosBytes > totalLenBytes THEN newPosBytes = totalLenBytes
                                     BASS_ChannelSetPosition(hStream, newPosBytes)
@@ -5188,6 +6829,18 @@ WHILE argIdx < g_TrackCount
                             ELSE
                                 downDown = 0
                             ENDIF
+
+                           IF (GetAsyncKeyState(0x70) & 0x8000) <> 0 THEN
+                               IF f1Down = 0 THEN
+                                   f1Down = 1
+                                   upDown = 0 : downDown = 0
+                                   SwitchToHelpView()
+                               ENDIF
+                           ELSE
+                               f1Down = 0
+                           ENDIF
+
+                            PollSeekKeys()
 
                             g_CommentTick = g_CommentTick + 1
                             IF g_CommentTick >= 15000 THEN
@@ -5222,16 +6875,38 @@ WHILE argIdx < g_TrackCount
 BASS_ChannelPlay(hStream, 0)
                                     CASE "s"
                                         g_Shuffle = 1 - g_Shuffle
+                                        DiscardPreload()
                                         IF g_Shuffle = 1 THEN shufStr = "ON " ELSE shufStr = "OFF"
                                         RedrawPlayerView()
+                                    CASE "g"
+                                       g_RGMode = (g_RGMode + 1) % 3
+                                       ApplyAgcSmoothed(hStream)
+                                       UpdateStreamVolume(hStream)
+                                       SaveConfig()
+                                       RedrawPlayerView()
                                     CASE "c"
                                         IF g_ExtDisplay = 1 THEN g_ExtDisplay = 0 ELSE g_ExtDisplay = 1
                                         g_CommentPage = 0 : g_CommentTick = 0 : g_LastActiveLyric = -2
+                                        ClearExtRegion()
                                         RefreshExtendedDisplayBuf(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
                                     CASE "l"
                                         IF g_ExtDisplay = 2 THEN g_ExtDisplay = 0 ELSE g_ExtDisplay = 2
                                         g_CommentPage = 0 : g_CommentTick = 0 : g_LastActiveLyric = -2
+                                        ClearExtRegion()
                                         RefreshExtendedDisplayBuf(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                                   CASE "v"
+                                       IF g_ExtDisplay = 4 THEN g_ExtDisplay = 3 ELSE g_ExtDisplay = 4
+                                       g_CommentPage = 0 : g_CommentTick = 0 : g_LastActiveLyric = -2
+                                       ClearExtRegion()
+                                       RefreshExtendedDisplayBuf(g_pComments, g_pLyrics, currentSecs, marqueeOffset)
+                                       FlushExtendedRegion(g_hConsole)
+                                    CASE "y"
+                                        upDown = 0 : downDown = 0
+                                        g_BrMode = 1
+                                        g_PlaylistSelectIdx = 0
+                                        g_PlaylistScrollOffset = 0
+                                        SwitchToPlaylistView()
+
                                     CASE "o"
                                         ' to guarantee no leftover key state triggers a volume step
                                         upDown = 0 : downDown = 0
@@ -5245,6 +6920,13 @@ BASS_ChannelPlay(hStream, 0)
                                         SetTheme()             ' Updates color variables & populates g_FrameBuf
                                         RedrawPlayerView()     ' Flushes full buffer (including Row 24) and redraws cover art
                                         g_LastActiveLyric = -2
+                                   CASE "?"
+                                       upDown = 0 : downDown = 0
+                                       SwitchToHelpView()
+                                   CASE "h"
+                                       upDown = 0 : downDown = 0
+                                       SwitchToHelpView()
+
                                 ENDSELECT
                             ENDIF
                     ENDSELECT
@@ -5273,6 +6955,9 @@ BASS_ChannelPlay(hStream, 0)
                     ' Trace("Hardware device lost or re-enumerated. Stream paused safely.")
                 ENDIF
             ENDIF
+
+            ' Begin background scanning of audio files 
+            LibScanStep(3)
 
             ' Pass addresses via & to allow in-place handle swapping
             CheckStreamTransition(&hStream, &argIdx)
@@ -5436,15 +7121,21 @@ IF g_hOldFadingStream <> 0 THEN
 ENDIF
 
 CLS
-PRINT "Saving config & playlist..."
-SaveConfig()
-SavePlaylistM3U()
-PRINT "Done !"
-GdiplusShutdown(gdiToken)
-BASS_Free()
-
 ' Switch back to original host shell screen buffer
 RestoreConsoleScreen()
+PRINT "Saving config & playlist..."
+SaveConfig()
+IF g_isResumeMode = 0 THEN SavePlaylistM3U()
+PRINT "Done."
+GdiplusShutdown(gdiToken)
+BASS_Free()
+IF g_LibDirty = 1 THEN
+    PRINT "Saving library cache..."
+    LibSaveCache()
+    PRINT "Done."
+ENDIF
+IF g_LibBlob <> 0 THEN DELETE g_LibBlob
+
 PRINT "Keep the retro vibes alive ! Returning to shell..."
 CLOSECONSOLE
 END
